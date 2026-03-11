@@ -3,10 +3,11 @@
  * Runs inside a container, receives config via stdin, and answers via Ollama.
  */
 
-import { execFileSync } from 'child_process';
 import { randomUUID } from 'crypto';
 import fs from 'fs';
 import path from 'path';
+
+import { webFetch, webSearch } from './browser-web.js';
 
 interface ContainerInput {
   prompt: string;
@@ -54,9 +55,8 @@ const DEFAULT_OLLAMA_HOSTS = [
   'http://localhost:11434',
 ];
 const MAX_TOOL_STEPS = 4;
-const CURL_ARGS = ['-L', '--max-time', '20', '--connect-timeout', '10', '-A', 'NanoClaw/1.0'];
 const INTERNET_REQUEST_PATTERN =
-  /\b(search|latest|today|current|news|official|website|site|web|internet|online|github)\b/i;
+  /\b(search|latest|today|current|news|official|website|site|web|internet|online|github|docs|documentation|release|version|价格|官网|新闻|最新|搜索|查一下|搜一下|联网)\b/i;
 const STALE_LIMITATION_PATTERN =
   /without Claude Code, external APIs, or remote tools|cannot access real[- ]?time network|do not have web search|cannot browse the web|as of 2024/i;
 
@@ -177,10 +177,14 @@ function buildSystemPrompt(input: ContainerInput): string {
     `You are ${assistantName}, a local NanoClaw assistant powered only by Ollama.`,
     'You are running without Claude Code or Anthropic services.',
     'You may use two built-in internet tools when fresh online information would help: web_search and web_fetch.',
+    'web_search uses a real browser to search the web. web_fetch uses a real browser to open a page and extract readable content.',
     'If you want to use a tool, reply with ONLY compact JSON and no markdown fences.',
     'Tool call format: {"tool":"web_search","input":{"query":"..."}} or {"tool":"web_fetch","input":{"url":"https://..."}}.',
     'Only call one tool at a time. After you receive tool output, continue reasoning and either call another tool or provide the final answer normally.',
     'If you already have enough information, answer normally and do not emit JSON.',
+    'If the user asks for fresh facts, search results, prices, release info, docs, websites, GitHub links, news, or anything likely to change, prefer using the internet tools instead of answering from stale memory.',
+    'When you answer using internet tool results, give a short direct answer first, then add a compact Sources section listing the source title and URL you relied on.',
+    'If the user explicitly asks to only return a URL, name, version, or another minimal format, follow that output format and omit extra prose.',
     'Be honest about limitations. Do not claim to have executed commands or modified files unless the host explicitly did so outside this model.',
     'Reply in the same language as the user when practical, and keep answers useful and direct.',
   );
@@ -205,6 +209,10 @@ function buildSystemPrompt(input: ContainerInput): string {
 
 function isLikelyInternetRequest(prompt: string): boolean {
   return INTERNET_REQUEST_PATTERN.test(prompt);
+}
+
+function buildAutomaticSearchQuery(prompt: string): string {
+  return prompt.replace(/\s+/g, ' ').trim().slice(0, 240);
 }
 
 function shouldClose(): boolean {
@@ -273,101 +281,6 @@ function waitForIpcMessage(): Promise<string | null> {
   });
 }
 
-function runCurl(url: string): string {
-  return execFileSync('curl', [...CURL_ARGS, url], {
-    encoding: 'utf8',
-    maxBuffer: 2 * 1024 * 1024,
-    env: process.env,
-  });
-}
-
-function decodeHtml(value: string): string {
-  return value
-    .replace(/&amp;/g, '&')
-    .replace(/&quot;/g, '"')
-    .replace(/&#39;/g, "'")
-    .replace(/&lt;/g, '<')
-    .replace(/&gt;/g, '>')
-    .replace(/&#x2F;/g, '/');
-}
-
-function stripHtml(html: string): string {
-  return decodeHtml(
-    html
-      .replace(/<script[\s\S]*?<\/script>/gi, ' ')
-      .replace(/<style[\s\S]*?<\/style>/gi, ' ')
-      .replace(/<[^>]+>/g, ' ')
-      .replace(/\s+/g, ' ')
-      .trim(),
-  );
-}
-
-function extractTitle(html: string): string {
-  const match = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
-  return match ? stripHtml(match[1]) : '';
-}
-
-function resolveDuckDuckGoUrl(url: string): string {
-  try {
-    const parsed = new URL(url, 'https://duckduckgo.com');
-    const uddg = parsed.searchParams.get('uddg');
-    if (uddg) {
-      return decodeURIComponent(uddg);
-    }
-    return parsed.toString();
-  } catch {
-    return url;
-  }
-}
-
-function webSearch(query: string): string {
-  if (!query.trim()) {
-    throw new Error('web_search requires a non-empty query');
-  }
-
-  const searchUrl = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`;
-  const html = runCurl(searchUrl);
-  const matches = [...html.matchAll(/<a[^>]+class="result__a"[^>]+href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/gi)];
-  const fallback = matches.length === 0
-    ? [...html.matchAll(/<a[^>]+href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/gi)].slice(0, 8)
-    : matches;
-
-  const results = fallback
-    .map((match) => {
-      const url = resolveDuckDuckGoUrl(match[1]);
-      const title = stripHtml(match[2]);
-      if (!title || !/^https?:/i.test(url)) return null;
-      return { title, url };
-    })
-    .filter((result): result is { title: string; url: string } => result !== null)
-    .slice(0, 5);
-
-  if (results.length === 0) {
-    return `No search results found for: ${query}`;
-  }
-
-  return [
-    `Search results for: ${query}`,
-    ...results.map((result, index) => `${index + 1}. ${result.title}\n${result.url}`),
-  ].join('\n\n');
-}
-
-function webFetch(url: string): string {
-  if (!/^https?:\/\//i.test(url)) {
-    throw new Error('web_fetch only supports http and https URLs');
-  }
-
-  const html = runCurl(url);
-  const title = extractTitle(html);
-  const text = stripHtml(html).slice(0, 6000);
-  const sections = [`Fetched: ${url}`];
-  if (title) {
-    sections.push(`Title: ${title}`);
-  }
-  sections.push(`Content:\n${text || '[no text content extracted]'}`);
-  return sections.join('\n\n');
-}
-
 function parseToolCall(text: string): ToolCall | null {
   const trimmed = text.trim();
   const withoutFences = trimmed
@@ -385,7 +298,7 @@ function parseToolCall(text: string): ToolCall | null {
   }
 }
 
-function executeToolCall(call: ToolCall): string {
+async function executeToolCall(call: ToolCall): Promise<string> {
   if (call.tool === 'web_search') {
     return webSearch(call.input.query || '');
   }
@@ -552,6 +465,18 @@ async function generateReply(
 
     const toolCall = parseToolCall(result.text);
     if (!toolCall) {
+      if (step === 0 && isLikelyInternetRequest(prompt)) {
+        const autoQuery = buildAutomaticSearchQuery(prompt);
+        log(`No tool call emitted for likely internet request, auto-searching: ${autoQuery}`);
+        const autoToolOutput = await webSearch(autoQuery);
+        messages.push({
+          role: 'user',
+          content:
+            `Automatic web search results for the latest user request:\n${autoToolOutput}\n\nUse these results to answer the user directly. Prefer citing the exact source titles and URLs you rely on. Request web_fetch if you need to inspect one result in more detail.`,
+        });
+        continue;
+      }
+
       let finalText = result.text;
       if (onStream) {
         const streamMessages: ConversationMessage[] = [
@@ -583,11 +508,11 @@ async function generateReply(
     }
 
     log(`Executing tool: ${toolCall.tool}`);
-    const toolOutput = executeToolCall(toolCall);
+    const toolOutput = await executeToolCall(toolCall);
     messages.push({ role: 'assistant', content: result.text });
     messages.push({
       role: 'user',
-      content: `Tool result for ${toolCall.tool}:\n${toolOutput}\n\nNow continue and answer the user, or request another tool if still necessary.`,
+      content: `Tool result for ${toolCall.tool}:\n${toolOutput}\n\nNow continue and answer the user. Give the answer first, then include a compact Sources section with the exact titles and URLs you used unless the user asked for a minimal-format response. Request another tool only if still necessary.`,
     });
   }
 
