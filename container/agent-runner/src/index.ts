@@ -183,6 +183,7 @@ function buildSystemPrompt(input: ContainerInput): string {
     'Only call one tool at a time. After you receive tool output, continue reasoning and either call another tool or provide the final answer normally.',
     'If you already have enough information, answer normally and do not emit JSON.',
     'If the user asks for fresh facts, search results, prices, release info, docs, websites, GitHub links, news, or anything likely to change, prefer using the internet tools instead of answering from stale memory.',
+    'Infer the reply language from the latest user prompt. If the latest user prompt is in Chinese, answer in Simplified Chinese even when search results or fetched pages are in English.',
     'When you answer using internet tool results, give a short direct answer first, then add a compact Sources section listing the source title and URL you relied on.',
     'If the user explicitly asks to only return a URL, name, version, or another minimal format, follow that output format and omit extra prose.',
     'Be honest about limitations. Do not claim to have executed commands or modified files unless the host explicitly did so outside this model.',
@@ -453,7 +454,7 @@ async function generateReply(
     messages.splice(1, 0, {
       role: 'system',
       content:
-        'The latest user request appears to need fresh web information. Prefer using web_search first, then web_fetch when a result page needs confirmation. Do not answer that you lack internet access unless a tool call actually fails.',
+        'The latest user request appears to need fresh web information. Prefer using web_search first, then web_fetch when a result page needs confirmation. Keep the final answer in the same language as the latest user prompt. Do not answer that you lack internet access unless a tool call actually fails.',
     });
   }
 

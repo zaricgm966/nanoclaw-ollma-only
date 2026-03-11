@@ -6,6 +6,12 @@ const MAX_RESULT_COUNT = 5;
 
 let browserPromise: Promise<Browser> | null = null;
 
+interface SearchResult {
+  title: string;
+  url: string;
+  snippet: string;
+}
+
 function getExecutablePath(): string {
   return (
     process.env.PUPPETEER_EXECUTABLE_PATH ||
@@ -51,7 +57,7 @@ async function withPage<T>(work: (page: Page) => Promise<T>): Promise<T> {
   const page = await browser.newPage();
   page.setDefaultNavigationTimeout(DEFAULT_TIMEOUT_MS);
   page.setDefaultTimeout(DEFAULT_TIMEOUT_MS);
-  await page.setUserAgent('NanoClawBrowser/1.0');
+  await page.setUserAgent('Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36 NanoClawBrowser/1.0');
 
   try {
     return await work(page);
@@ -69,12 +75,56 @@ function truncateText(value: string, maxLength = MAX_TEXT_LENGTH): string {
   return `${value.slice(0, maxLength)}...`;
 }
 
+function decodeBingRedirect(url: string): string {
+  try {
+    const parsed = new URL(url);
+    if (!/bing\.com$/i.test(parsed.hostname)) {
+      return url;
+    }
+
+    const raw = parsed.searchParams.get('u') || '';
+    if (!raw) {
+      return url;
+    }
+
+    const payload = raw.startsWith('a1') ? raw.slice(2) : raw;
+    const decoded = Buffer.from(payload, 'base64').toString('utf8');
+    if (/^https?:\/\//i.test(decoded)) {
+      return decoded;
+    }
+
+    return url;
+  } catch {
+    return url;
+  }
+}
+
 function getDomain(url: string): string {
   try {
     return new URL(url).hostname;
   } catch {
     return '';
   }
+}
+
+async function extractBingResults(page: Page): Promise<SearchResult[]> {
+  await page.waitForSelector('li.b_algo h2 a', { timeout: 10000 }).catch(() => undefined);
+
+  return page.evaluate((maxCount) => {
+    const items = Array.from(document.querySelectorAll('li.b_algo'));
+    return items
+      .map((item) => {
+        const anchor = item.querySelector('h2 a') as HTMLAnchorElement | null;
+        const snippetNode = item.querySelector('.b_caption p') || item.querySelector('p');
+        const title = (anchor?.textContent || '').replace(/\s+/g, ' ').trim();
+        const url = anchor?.href || '';
+        const snippet = (snippetNode?.textContent || '').replace(/\s+/g, ' ').trim();
+        if (!title || !url) return null;
+        return { title, url, snippet };
+      })
+      .filter((item): item is { title: string; url: string; snippet: string } => item !== null)
+      .slice(0, maxCount);
+  }, MAX_RESULT_COUNT);
 }
 
 export async function webSearch(query: string): Promise<string> {
@@ -84,56 +134,37 @@ export async function webSearch(query: string): Promise<string> {
   }
 
   return withPage(async (page) => {
-    const url = `https://duckduckgo.com/html/?q=${encodeURIComponent(trimmed)}`;
+    const url = `https://www.bing.com/search?q=${encodeURIComponent(trimmed)}&setlang=zh-Hans`;
     await page.goto(url, { waitUntil: 'domcontentloaded' });
 
-    const results = await page.evaluate(() => {
-      const anchors = Array.from(document.querySelectorAll('a.result__a'));
-      const fallback = anchors.length
-        ? anchors
-        : Array.from(document.querySelectorAll('a[href]'));
-
-      return fallback
-        .map((anchor) => {
-          const href = anchor.getAttribute('href') || '';
-          const title = (anchor.textContent || '').replace(/\s+/g, ' ').trim();
-          if (!href || !title) return null;
-          return { href, title };
-        })
-        .filter((item): item is { href: string; title: string } => item !== null)
-        .slice(0, 8);
-    });
-
-    const normalized = results
-      .map((result) => {
-        try {
-          const target = new URL(result.href, 'https://duckduckgo.com');
-          const uddg = target.searchParams.get('uddg');
-          const href = uddg ? decodeURIComponent(uddg) : target.toString();
-          if (!/^https?:/i.test(href)) return null;
-          return { title: result.title, url: href };
-        } catch {
-          if (!/^https?:/i.test(result.href)) return null;
-          return { title: result.title, url: result.href };
-        }
-      })
-      .filter((item): item is { title: string; url: string } => item !== null)
-      .slice(0, MAX_RESULT_COUNT);
-
-    if (normalized.length === 0) {
-      return `No search results found for: ${trimmed}`;
+    const results = (await extractBingResults(page)).map((result) => ({
+      ...result,
+      url: decodeBingRedirect(result.url),
+    }));
+    if (results.length === 0) {
+      const pageTitle = normalizeWhitespace(await page.title());
+      const visibleText = normalizeWhitespace(
+        await page.evaluate(() => (document.body?.innerText || '').slice(0, 500)),
+      );
+      return [
+        `SEARCH_QUERY: ${trimmed}`,
+        'RESULT_COUNT: 0',
+        `PAGE_TITLE: ${pageTitle || '[unknown]'}`,
+        `PAGE_HINT: ${visibleText || '[no visible text extracted]'}`,
+      ].join('\n\n');
     }
 
     return [
       `SEARCH_QUERY: ${trimmed}`,
-      `RESULT_COUNT: ${normalized.length}`,
-      ...normalized.map(
+      `RESULT_COUNT: ${results.length}`,
+      ...results.map(
         (result, index) =>
           [
             `RESULT ${index + 1}`,
             `TITLE: ${result.title}`,
             `URL: ${result.url}`,
             `DOMAIN: ${getDomain(result.url) || '[unknown]'}`,
+            `SNIPPET: ${result.snippet || '[no snippet]'}`,
           ].join('\n'),
       ),
     ].join('\n\n');
