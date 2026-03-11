@@ -155,7 +155,16 @@ export function DirectChatPage() {
                 </div>
                 {isAssistant ? (
                   <div className="markdown-body">
-                    <ReactMarkdown remarkPlugins={[remarkGfm]}>{item.content}</ReactMarkdown>
+                    <ReactMarkdown
+                      remarkPlugins={[remarkGfm]}
+                      components={{
+                        a: ({ node, ...props }) => (
+                          <a {...props} target="_blank" rel="noreferrer noopener" />
+                        ),
+                      }}
+                    >
+                      {item.content}
+                    </ReactMarkdown>
                   </div>
                 ) : (
                   <p>{item.content}</p>
