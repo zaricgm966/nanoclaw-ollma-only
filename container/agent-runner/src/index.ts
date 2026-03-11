@@ -212,8 +212,23 @@ function isLikelyInternetRequest(prompt: string): boolean {
   return INTERNET_REQUEST_PATTERN.test(prompt);
 }
 
+function decodeXmlEntities(value: string): string {
+  return value
+    .replace(/&quot;/g, '"')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&amp;/g, '&');
+}
+
 function buildAutomaticSearchQuery(prompt: string): string {
-  return prompt.replace(/\s+/g, ' ').trim().slice(0, 240);
+  const matches = [...prompt.matchAll(/<message\s+[^>]*>([\s\S]*?)<\/message>/g)];
+  const latestMessage = matches.length > 0 ? matches[matches.length - 1][1] : '';
+  const candidate = decodeXmlEntities(latestMessage || prompt)
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  return candidate.slice(0, 240);
 }
 
 function shouldClose(): boolean {

@@ -68,6 +68,9 @@ interface DirectChatRunOptions {
   onChunk?: (chunk: string) => void | Promise<void>;
 }
 
+const DIRECT_CHAT_STALE_ASSISTANT_PATTERN =
+  /User-Agent|DuckDuckGo's homepage|search results only show|Could you please clarify what you'd like me to help you with/i;
+
 const WEB_DIST_DIR = path.resolve(process.cwd(), 'apps', 'web', 'dist');
 const DIRECT_CHAT_JID = 'web:direct';
 const DIRECT_GROUP_FOLDER = 'web_console';
@@ -135,7 +138,13 @@ function buildDirectChatPrompt(
   messageHistory: ReturnType<typeof getRecentMessages>,
   userAgent: string | undefined,
 ): string {
-  const basePrompt = formatMessages(messageHistory, TIMEZONE);
+  const sanitizedHistory = messageHistory.filter((message) => {
+    if (message.sender !== 'web:assistant' && !message.is_bot_message) {
+      return true;
+    }
+    return !DIRECT_CHAT_STALE_ASSISTANT_PATTERN.test(message.content);
+  });
+  const basePrompt = formatMessages(sanitizedHistory, TIMEZONE);
   if (!userAgent) return basePrompt;
   const clientContext = `<client channel="web" userAgent="${escapeXml(userAgent)}" />\n`;
   return `${clientContext}${basePrompt}`;
