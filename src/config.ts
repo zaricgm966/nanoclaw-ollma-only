@@ -6,7 +6,7 @@ import { readEnvFile } from './env.js';
 // Read config values from .env (falls back to process.env).
 // Secrets are NOT read here — they stay on disk and are loaded only
 // where needed (container-runner.ts) to avoid leaking to child processes.
-const envConfig = readEnvFile(['ASSISTANT_NAME', 'ASSISTANT_HAS_OWN_NUMBER']);
+const envConfig = readEnvFile(['ASSISTANT_NAME', 'ASSISTANT_HAS_OWN_NUMBER', 'WEB_UI_ENABLED', 'WEB_UI_HOST', 'WEB_UI_PORT']);
 
 export const ASSISTANT_NAME =
   process.env.ASSISTANT_NAME || envConfig.ASSISTANT_NAME || 'Andy';
@@ -67,3 +67,12 @@ export const TRIGGER_PATTERN = new RegExp(
 // Uses system timezone by default
 export const TIMEZONE =
   process.env.TZ || Intl.DateTimeFormat().resolvedOptions().timeZone;
+
+export const WEB_UI_ENABLED =
+  (process.env.WEB_UI_ENABLED || envConfig.WEB_UI_ENABLED || 'false') === 'true';
+export const WEB_UI_HOST =
+  process.env.WEB_UI_HOST || envConfig.WEB_UI_HOST || '127.0.0.1';
+export const WEB_UI_PORT = parseInt(
+  process.env.WEB_UI_PORT || envConfig.WEB_UI_PORT || '3310',
+  10,
+);

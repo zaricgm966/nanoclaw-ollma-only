@@ -7,6 +7,9 @@ import {
   POLL_INTERVAL,
   TIMEZONE,
   TRIGGER_PATTERN,
+  WEB_UI_ENABLED,
+  WEB_UI_HOST,
+  WEB_UI_PORT,
 } from './config.js';
 import './channels/index.js';
 import {
@@ -52,6 +55,7 @@ import {
 import { startSchedulerLoop } from './task-scheduler.js';
 import { Channel, NewMessage, RegisteredGroup } from './types.js';
 import { logger } from './logger.js';
+import { startWebServer } from './web/server.js';
 
 // Re-export for backwards compatibility during refactor
 export { escapeXml, formatMessages } from './router.js';
@@ -467,6 +471,17 @@ async function main(): Promise<void> {
   initDatabase();
   logger.info('Database initialized');
   loadState();
+
+  if (WEB_UI_ENABLED) {
+    await startWebServer({
+      host: WEB_UI_HOST,
+      port: WEB_UI_PORT,
+      assistantName: ASSISTANT_NAME,
+      channels: () => channels,
+      registeredGroups: () => registeredGroups,
+      sessions: () => sessions,
+    });
+  }
 
   // Graceful shutdown handlers
   const shutdown = async (signal: string) => {

@@ -1,8 +1,16 @@
-# Dependencies
+﻿# Dependencies
 node_modules/
 .npm-cache/
+
 # Build output
 dist/
+*.tsbuildinfo
+*.tsbuildinfo.*
+*.d.ts.map
+
+# Local generated config output
+apps/web/vite.config.js
+apps/web/vite.config.d.ts
 
 # Local data & auth
 store/
@@ -24,6 +32,7 @@ groups/global/*
 
 # Temp files
 .tmp-*
+.tmp-direct-chat.json
 
 # OS
 .DS_Store
