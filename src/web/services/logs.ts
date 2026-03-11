@@ -10,10 +10,16 @@ function tailLines(filePath: string, maxLines: number): string[] {
 }
 
 export function readAppLogs(maxLines: number = 200): string[] {
-  return tailLines(path.resolve(process.cwd(), 'logs', 'nanoclaw.log'), maxLines);
+  return tailLines(
+    path.resolve(process.cwd(), 'logs', 'nanoclaw.log'),
+    maxLines,
+  );
 }
 
-export function readGroupLogs(groupFolder: string, maxLines: number = 200): string[] {
+export function readGroupLogs(
+  groupFolder: string,
+  maxLines: number = 200,
+): string[] {
   const logsDir = path.join(GROUPS_DIR, groupFolder, 'logs');
   if (!fs.existsSync(logsDir)) return [];
 

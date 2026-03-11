@@ -122,7 +122,9 @@ function extractTextFromSegments(segments: OneBotMessageSegment[]): string {
         parts.push('[Video]');
         break;
       case 'file':
-        parts.push(segment.data?.name ? `[File: ${segment.data.name}]` : '[File]');
+        parts.push(
+          segment.data?.name ? `[File: ${segment.data.name}]` : '[File]',
+        );
         break;
       case 'json':
         parts.push('[JSON]');
@@ -197,7 +199,9 @@ export class QQChannel implements Channel {
         }
         logger.info({ wsUrl: this.wsUrl }, 'QQ OneBot connected');
         console.log(`\n  QQ channel connected via OneBot: ${this.wsUrl}`);
-        console.log('  Send /chatid in a QQ chat to get a registration ID for NanoClaw\n');
+        console.log(
+          '  Send /chatid in a QQ chat to get a registration ID for NanoClaw\n',
+        );
       });
 
       socket.addEventListener('message', (event) => {
@@ -217,7 +221,9 @@ export class QQChannel implements Channel {
         if (!settled) {
           settled = true;
           reject(
-            new Error(`QQ OneBot WS closed during connect (${event.code} ${event.reason})`),
+            new Error(
+              `QQ OneBot WS closed during connect (${event.code} ${event.reason})`,
+            ),
           );
         } else {
           logger.warn(
@@ -257,7 +263,9 @@ export class QQChannel implements Channel {
       if (payload.status === 'ok' || payload.retcode === 0) {
         request.resolve(payload.data);
       } else {
-        request.reject(new Error(`OneBot action failed: ${payload.retcode ?? 'unknown'}`));
+        request.reject(
+          new Error(`OneBot action failed: ${payload.retcode ?? 'unknown'}`),
+        );
       }
       return;
     }
@@ -280,7 +288,10 @@ export class QQChannel implements Channel {
       return;
     }
 
-    let content = maybeTranslateMention(extractMessageText(payload), this.selfId);
+    let content = maybeTranslateMention(
+      extractMessageText(payload),
+      this.selfId,
+    );
     if (!content) content = '[Unsupported message]';
 
     if (content === '/ping') {
@@ -324,7 +335,10 @@ export class QQChannel implements Channel {
     logger.info({ chatJid, sender: message.sender_name }, 'QQ message stored');
   }
 
-  private sendAction(action: string, params: Record<string, unknown>): Promise<unknown> {
+  private sendAction(
+    action: string,
+    params: Record<string, unknown>,
+  ): Promise<unknown> {
     if (!this.socket || this.socket.readyState !== WebSocket.OPEN) {
       return Promise.reject(new Error('QQ OneBot socket is not connected'));
     }
@@ -381,7 +395,9 @@ export class QQChannel implements Channel {
     this.connected = false;
     for (const [echo, pending] of this.pending) {
       clearTimeout(pending.timer);
-      pending.reject(new Error(`QQ channel disconnected before response: ${echo}`));
+      pending.reject(
+        new Error(`QQ channel disconnected before response: ${echo}`),
+      );
     }
     this.pending.clear();
   }
@@ -391,9 +407,7 @@ registerChannel('qq', (opts: ChannelOpts) => {
   const envVars = readEnvFile(['QQ_ONEBOT_WS_URL', 'QQ_ONEBOT_ACCESS_TOKEN']);
   const wsUrl = process.env.QQ_ONEBOT_WS_URL || envVars.QQ_ONEBOT_WS_URL || '';
   const accessToken =
-    process.env.QQ_ONEBOT_ACCESS_TOKEN ||
-    envVars.QQ_ONEBOT_ACCESS_TOKEN ||
-    '';
+    process.env.QQ_ONEBOT_ACCESS_TOKEN || envVars.QQ_ONEBOT_ACCESS_TOKEN || '';
 
   if (!wsUrl) {
     logger.warn('QQ: QQ_ONEBOT_WS_URL not set');

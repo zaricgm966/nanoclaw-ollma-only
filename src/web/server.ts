@@ -295,18 +295,26 @@ async function runDirectChatTurn(
         finalReply = formatOutbound(chunk.result);
       }
       if (chunk.done && activeContainerName) {
-        exec(stopContainer(activeContainerName), { timeout: 15000 }, () => undefined);
+        exec(
+          stopContainer(activeContainerName),
+          { timeout: 15000 },
+          () => undefined,
+        );
       }
     },
   );
 
   if (streamedSessionId || output.newSessionId) {
-    sessions[DIRECT_GROUP_FOLDER] = streamedSessionId || output.newSessionId || '';
+    sessions[DIRECT_GROUP_FOLDER] =
+      streamedSessionId || output.newSessionId || '';
     setSession(DIRECT_GROUP_FOLDER, sessions[DIRECT_GROUP_FOLDER]);
   }
 
   if (output.status !== 'success' && !streamedReply) {
-    logger.error({ error: output.error, userAgent }, 'Direct chat request failed');
+    logger.error(
+      { error: output.error, userAgent },
+      'Direct chat request failed',
+    );
     throw new Error(output.error || 'direct_chat_failed');
   }
 
@@ -366,7 +374,12 @@ async function handleDirectChat(
     sendJson(res, 200, result);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    const status = message === 'message_required' ? 400 : message === 'empty_reply' ? 502 : 500;
+    const status =
+      message === 'message_required'
+        ? 400
+        : message === 'empty_reply'
+          ? 502
+          : 500;
     sendJson(res, status, {
       error: status === 500 ? 'direct_chat_failed' : message,
       message,
@@ -503,7 +516,11 @@ export function startWebServer(options: WebServerOptions): Promise<void> {
     }
 
     if (pathname === '/api/direct-chat/messages') {
-      sendJson(res, 200, getRecentMessages(DIRECT_CHAT_JID, parseLimit(requestUrl, 100)));
+      sendJson(
+        res,
+        200,
+        getRecentMessages(DIRECT_CHAT_JID, parseLimit(requestUrl, 100)),
+      );
       return;
     }
 
@@ -547,7 +564,12 @@ export function startWebServer(options: WebServerOptions): Promise<void> {
       sendJson(
         res,
         200,
-        getMessagesSince(jid, '', options.assistantName || ASSISTANT_NAME, limit),
+        getMessagesSince(
+          jid,
+          '',
+          options.assistantName || ASSISTANT_NAME,
+          limit,
+        ),
       );
       return;
     }
@@ -560,7 +582,12 @@ export function startWebServer(options: WebServerOptions): Promise<void> {
       sendJson(
         res,
         200,
-        getMessagesSince(jid, '', options.assistantName || ASSISTANT_NAME, limit),
+        getMessagesSince(
+          jid,
+          '',
+          options.assistantName || ASSISTANT_NAME,
+          limit,
+        ),
       );
       return;
     }

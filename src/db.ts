@@ -367,7 +367,7 @@ export function getRecentMessages(
   chatJid: string,
   limit: number = 200,
 ): NewMessage[] {
-  const sql =     `
+  const sql = `
     SELECT * FROM (
       SELECT id, chat_jid, sender, sender_name, content, timestamp, is_from_me, is_bot_message
       FROM messages

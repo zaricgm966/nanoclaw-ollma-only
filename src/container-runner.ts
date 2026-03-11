@@ -167,7 +167,10 @@ function buildVolumeMounts(
   );
   if (fs.existsSync(agentRunnerSrc)) {
     fs.mkdirSync(groupAgentRunnerDir, { recursive: true });
-    fs.cpSync(agentRunnerSrc, groupAgentRunnerDir, { recursive: true, force: true });
+    fs.cpSync(agentRunnerSrc, groupAgentRunnerDir, {
+      recursive: true,
+      force: true,
+    });
   }
   mounts.push({
     hostPath: groupAgentRunnerDir,

@@ -27,7 +27,8 @@ export function buildSummary(state: WebServerState): WebSummary {
     assistantName: state.assistantName,
     startedAt: state.startedAt,
     channelCount: channels.length,
-    connectedChannels: channels.filter((channel) => channel.isConnected()).length,
+    connectedChannels: channels.filter((channel) => channel.isConnected())
+      .length,
     registeredGroupCount: Object.keys(state.registeredGroups()).length,
     sessionCount: Object.keys(state.sessions()).length,
     taskCount: state.taskCount(),
