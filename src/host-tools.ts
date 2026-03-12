@@ -24,9 +24,7 @@ function execFileAsync(
   return new Promise((resolve, reject) => {
     execFile(command, args, { windowsHide: true }, (error, stdout, stderr) => {
       if (error) {
-        reject(
-          new Error(stderr?.trim() || stdout?.trim() || error.message),
-        );
+        reject(new Error(stderr?.trim() || stdout?.trim() || error.message));
         return;
       }
       resolve({ stdout, stderr });

@@ -733,7 +733,10 @@ export function startWebServer(options: WebServerOptions): Promise<void> {
       const fileName = path.basename(pathname.replace('/api/screenshots/', ''));
       const screenshotsDir = path.join(process.cwd(), 'store', 'screenshots');
       const screenshotPath = path.join(screenshotsDir, fileName);
-      if (!fs.existsSync(screenshotPath) || !fs.statSync(screenshotPath).isFile()) {
+      if (
+        !fs.existsSync(screenshotPath) ||
+        !fs.statSync(screenshotPath).isFile()
+      ) {
         sendNotFound(res);
         return;
       }

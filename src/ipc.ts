@@ -157,8 +157,7 @@ export function startIpcWatcher(deps: IpcDeps): void {
                 JSON.stringify(
                   {
                     ok: false,
-                    message:
-                      err instanceof Error ? err.message : String(err),
+                    message: err instanceof Error ? err.message : String(err),
                   },
                   null,
                   2,
