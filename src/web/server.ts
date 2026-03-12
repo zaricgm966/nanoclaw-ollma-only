@@ -163,7 +163,10 @@ function parseDirectAssistantContent(content: string): {
   };
 }
 
-function serializeDirectAssistantContent(thinking: string, reply: string): string {
+function serializeDirectAssistantContent(
+  thinking: string,
+  reply: string,
+): string {
   const trimmedThinking = thinking.trim();
   const trimmedReply = reply.trim();
   if (!trimmedThinking) {
@@ -355,7 +358,8 @@ async function runDirectChatTurn(
         streamedSessionId = chunk.newSessionId;
       }
       if (chunk.stream && chunk.result) {
-        const streamKind = chunk.streamKind === 'thinking' ? 'thinking' : 'content';
+        const streamKind =
+          chunk.streamKind === 'thinking' ? 'thinking' : 'content';
         if (streamKind === 'thinking') {
           streamedThinking += chunk.result;
         } else {
