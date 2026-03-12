@@ -1,8 +1,10 @@
 ﻿import puppeteer, { Browser, Page } from 'puppeteer-core';
 
-const MAX_TEXT_LENGTH = 6000;
-const DEFAULT_TIMEOUT_MS = 20000;
+export const MAX_TEXT_LENGTH = 6000;
+export const DEFAULT_TIMEOUT_MS = 20000;
 const MAX_RESULT_COUNT = 5;
+export const DEFAULT_USER_AGENT =
+  'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36 NanoClawBrowser/1.0';
 
 let browserPromise: Promise<Browser> | null = null;
 
@@ -12,7 +14,7 @@ interface SearchResult {
   snippet: string;
 }
 
-function getExecutablePath(): string {
+export function getExecutablePath(): string {
   return (
     process.env.PUPPETEER_EXECUTABLE_PATH ||
     process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH ||
@@ -21,7 +23,7 @@ function getExecutablePath(): string {
   );
 }
 
-function getLaunchArgs(): string[] {
+export function getLaunchArgs(): string[] {
   const args = [
     '--headless=new',
     '--no-sandbox',
@@ -40,7 +42,7 @@ function getLaunchArgs(): string[] {
   return args;
 }
 
-async function getBrowser(): Promise<Browser> {
+export async function getBrowser(): Promise<Browser> {
   if (!browserPromise) {
     browserPromise = puppeteer.launch({
       executablePath: getExecutablePath(),
@@ -52,12 +54,12 @@ async function getBrowser(): Promise<Browser> {
   return browserPromise;
 }
 
-async function withPage<T>(work: (page: Page) => Promise<T>): Promise<T> {
+export async function withPage<T>(work: (page: Page) => Promise<T>): Promise<T> {
   const browser = await getBrowser();
   const page = await browser.newPage();
   page.setDefaultNavigationTimeout(DEFAULT_TIMEOUT_MS);
   page.setDefaultTimeout(DEFAULT_TIMEOUT_MS);
-  await page.setUserAgent('Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36 NanoClawBrowser/1.0');
+  await page.setUserAgent(DEFAULT_USER_AGENT);
 
   try {
     return await work(page);
@@ -66,13 +68,17 @@ async function withPage<T>(work: (page: Page) => Promise<T>): Promise<T> {
   }
 }
 
-function normalizeWhitespace(value: string): string {
+export function normalizeWhitespace(value: string): string {
   return value.replace(/\s+/g, ' ').trim();
 }
 
-function truncateText(value: string, maxLength = MAX_TEXT_LENGTH): string {
+export function truncateText(value: string, maxLength = MAX_TEXT_LENGTH): string {
   if (value.length <= maxLength) return value;
   return `${value.slice(0, maxLength)}...`;
+}
+
+export function isHttpUrl(url: string): boolean {
+  return /^https?:\/\//i.test(url);
 }
 
 function decodeBingRedirect(url: string): string {
@@ -99,7 +105,7 @@ function decodeBingRedirect(url: string): string {
   }
 }
 
-function getDomain(url: string): string {
+export function getDomain(url: string): string {
   try {
     return new URL(url).hostname;
   } catch {
@@ -209,7 +215,7 @@ export async function webFetch(url: string): Promise<string> {
   });
 }
 
-async function closeBrowser(): Promise<void> {
+export async function closeBrowser(): Promise<void> {
   if (!browserPromise) return;
   const browser = await browserPromise.catch(() => null);
   browserPromise = null;

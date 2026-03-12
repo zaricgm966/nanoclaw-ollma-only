@@ -7,6 +7,23 @@ import { randomUUID } from 'crypto';
 import fs from 'fs';
 import path from 'path';
 
+import {
+  browserBack,
+  browserClick,
+  browserForward,
+  browserHover,
+  browserLinks,
+  browserNavigate,
+  browserPress,
+  browserRead,
+  browserReload,
+  browserScreenshot,
+  browserScroll,
+  browserSelect,
+  browserSnapshot,
+  browserType,
+  browserWaitForText,
+} from './browser-control.js';
 import { webFetch, webSearch } from './browser-web.js';
 
 interface ContainerInput {
@@ -41,11 +58,41 @@ interface ConversationMessage {
 }
 
 interface ToolCall {
-  tool: 'web_search' | 'web_fetch' | 'open_app' | 'take_screenshot';
+  tool:
+    | 'web_search'
+    | 'web_fetch'
+    | 'open_app'
+    | 'take_screenshot'
+    | 'browser_navigate'
+    | 'browser_snapshot'
+    | 'browser_click'
+    | 'browser_type'
+    | 'browser_scroll'
+    | 'browser_back'
+    | 'browser_forward'
+    | 'browser_reload'
+    | 'browser_read'
+    | 'browser_screenshot'
+    | 'browser_links'
+    | 'browser_press'
+    | 'browser_select'
+    | 'browser_hover'
+    | 'browser_wait_for_text';
   input: {
     query?: string;
     url?: string;
     app?: string;
+    elementId?: string;
+    text?: string;
+    direction?: 'up' | 'down';
+    amount?: number;
+    clear?: boolean;
+    submit?: boolean;
+    fullPage?: boolean;
+    path?: string;
+    key?: string;
+    value?: string;
+    timeoutMs?: number;
   };
 }
 
@@ -76,6 +123,27 @@ const DEFAULT_OLLAMA_HOSTS = [
   'http://localhost:11434',
 ];
 const MAX_TOOL_STEPS = 4;
+const SUPPORTED_TOOLS: ToolCall['tool'][] = [
+  'web_search',
+  'web_fetch',
+  'open_app',
+  'take_screenshot',
+  'browser_navigate',
+  'browser_snapshot',
+  'browser_click',
+  'browser_type',
+  'browser_scroll',
+  'browser_back',
+  'browser_forward',
+  'browser_reload',
+  'browser_read',
+  'browser_screenshot',
+  'browser_links',
+  'browser_press',
+  'browser_select',
+  'browser_hover',
+  'browser_wait_for_text',
+];
 const INTERNET_REQUEST_PATTERN =
   /\b(search|latest|today|current|news|official|website|site|web|internet|online|github|docs|documentation|release|version|price|prices|lookup|look up|find)\b|\u4ef7\u683c|\u5b98\u7f51|\u65b0\u95fb|\u6700\u65b0|\u641c\u7d22|\u67e5\u4e00\u4e0b|\u641c\u4e00\u4e0b|\u8054\u7f51/i;
 const SCREENSHOT_REQUEST_PATTERN =
@@ -201,11 +269,12 @@ function buildSystemPrompt(input: ContainerInput): string {
   parts.push(
     `You are ${assistantName}, a local NanoClaw assistant powered only by Ollama.`,
     'You are running without Claude Code or Anthropic services.',
-    'You may use four built-in tools when they help: web_search, web_fetch, open_app, and take_screenshot.',
+    'You may use built-in tools when they help: web_search, web_fetch, open_app, take_screenshot, browser_navigate, browser_snapshot, browser_click, browser_type, browser_scroll, browser_back, browser_forward, browser_reload, browser_read, browser_screenshot, browser_links, browser_press, browser_select, browser_hover, and browser_wait_for_text.',
     'web_search uses a real browser to search the web. web_fetch uses a real browser to open a page and extract readable content.',
+    'The browser_* tools control a persistent browser page for multi-step workflows. Start with browser_navigate to open a URL, use browser_snapshot to inspect the current page and get element IDs, then use browser_click, browser_type, browser_select, browser_hover, browser_scroll, browser_press, browser_back, browser_forward, browser_reload, browser_read, browser_links, browser_screenshot, and browser_wait_for_text as needed.',
     'open_app asks the host OS to open a desktop application by name or path. take_screenshot asks the host OS to capture the current desktop and returns the saved file path.',
     'If you want to use a tool, reply with ONLY compact JSON and no markdown fences.',
-    'Tool call format: {"tool":"web_search","input":{"query":"..."}}, {"tool":"web_fetch","input":{"url":"https://..."}}, {"tool":"open_app","input":{"app":"Notepad"}}, or {"tool":"take_screenshot","input":{}}.',
+    'Tool call examples: {"tool":"web_search","input":{"query":"latest NanoClaw GitHub repo"}}, {"tool":"browser_navigate","input":{"url":"https://example.com"}}, {"tool":"browser_click","input":{"elementId":"el-2"}}, {"tool":"browser_type","input":{"elementId":"el-3","text":"hello","clear":true}}, or {"tool":"open_app","input":{"app":"Notepad"}}.',
     'Only call one tool at a time. After you receive tool output, continue reasoning and either call another tool or provide the final answer normally.',
     'If you already have enough information, answer normally and do not emit JSON.',
     'If the user asks for fresh facts, search results, prices, release info, docs, websites, GitHub links, news, or anything likely to change, prefer using the internet tools instead of answering from stale memory.',
@@ -372,12 +441,9 @@ function parseToolCall(text: string): ToolCall | null {
   try {
     const parsed = JSON.parse(withoutFences) as ToolCall;
     if (!parsed || typeof parsed !== 'object') return null;
-    if (
-      parsed.tool !== 'web_search' &&
-      parsed.tool !== 'web_fetch' &&
-      parsed.tool !== 'open_app' &&
-      parsed.tool !== 'take_screenshot'
-    ) return null;
+    if (typeof parsed.tool !== 'string' || !SUPPORTED_TOOLS.includes(parsed.tool as ToolCall['tool'])) {
+      return null;
+    }
     if (!parsed.input || typeof parsed.input !== 'object') return null;
     return parsed;
   } catch {
@@ -451,6 +517,65 @@ async function executeHostTool(call: ToolCall): Promise<ExecutedHostToolResult> 
   };
 }
 
+function stringifyToolOutput(value: unknown): string {
+  if (typeof value === 'string') {
+    return value;
+  }
+  return JSON.stringify(value, null, 2);
+}
+
+async function executeBrowserTool(call: ToolCall): Promise<string> {
+  switch (call.tool) {
+    case 'browser_navigate':
+      return stringifyToolOutput(await browserNavigate(call.input.url || ''));
+    case 'browser_snapshot':
+      return stringifyToolOutput(await browserSnapshot());
+    case 'browser_click':
+      return stringifyToolOutput(await browserClick(call.input.elementId || ''));
+    case 'browser_type':
+      return stringifyToolOutput(
+        await browserType(call.input.elementId || '', call.input.text || '', {
+          clear: Boolean(call.input.clear),
+          submit: Boolean(call.input.submit),
+        }),
+      );
+    case 'browser_scroll':
+      return stringifyToolOutput(
+        await browserScroll(call.input.direction === 'up' ? 'up' : 'down', call.input.amount),
+      );
+    case 'browser_back':
+      return stringifyToolOutput(await browserBack());
+    case 'browser_forward':
+      return stringifyToolOutput(await browserForward());
+    case 'browser_reload':
+      return stringifyToolOutput(await browserReload());
+    case 'browser_read':
+      return stringifyToolOutput(await browserRead());
+    case 'browser_screenshot':
+      return stringifyToolOutput(
+        await browserScreenshot({
+          fullPage: call.input.fullPage,
+          path: call.input.path,
+        }),
+      );
+    case 'browser_links':
+      return stringifyToolOutput(await browserLinks());
+    case 'browser_press':
+      return stringifyToolOutput(await browserPress(call.input.key || ''));
+    case 'browser_select':
+      return stringifyToolOutput(
+        await browserSelect(call.input.elementId || '', call.input.value || ''),
+      );
+    case 'browser_hover':
+      return stringifyToolOutput(await browserHover(call.input.elementId || ''));
+    case 'browser_wait_for_text':
+      return stringifyToolOutput(
+        await browserWaitForText(call.input.text || '', call.input.timeoutMs),
+      );
+    default:
+      throw new Error('Unsupported browser tool: ' + call.tool);
+  }
+}
 function hasChinese(text: string): boolean {
   return /[\u3400-\u9fff]/.test(text);
 }
@@ -509,6 +634,9 @@ async function executeToolCall(call: ToolCall): Promise<string> {
   }
   if (call.tool === 'web_fetch') {
     return webFetch(call.input.url || '');
+  }
+  if (call.tool.startsWith('browser_')) {
+    return executeBrowserTool(call);
   }
   const hostResult = await executeHostTool(call);
   return hostResult.summary;
