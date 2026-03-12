@@ -423,6 +423,26 @@ a { color: inherit; text-decoration: none; }
   border-radius: 14px;
 }
 
+.chat-image {
+  display: block;
+  max-width: 100%;
+}
+
+.chat-image img {
+  display: block;
+  max-width: 100%;
+  height: auto;
+  border-radius: 16px;
+}
+
+.markdown-body img {
+  display: block;
+  max-width: 100%;
+  height: auto;
+  border-radius: 16px;
+  border: 1px solid rgba(38, 32, 25, 0.08);
+}
+
 .markdown-body th,
 .markdown-body td {
   padding: 10px 12px;

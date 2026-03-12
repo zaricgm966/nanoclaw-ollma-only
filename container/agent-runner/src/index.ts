@@ -41,17 +41,32 @@ interface ConversationMessage {
 }
 
 interface ToolCall {
-  tool: 'web_search' | 'web_fetch';
+  tool: 'web_search' | 'web_fetch' | 'open_app' | 'take_screenshot';
   input: {
     query?: string;
     url?: string;
+    app?: string;
   };
+}
+
+interface HostToolResult {
+  ok: boolean;
+  message: string;
+  screenshotPath?: string;
+  screenshotUrl?: string;
+}
+
+interface ExecutedHostToolResult {
+  summary: string;
+  raw: HostToolResult;
 }
 
 const OUTPUT_START_MARKER = '---NANOCLAW_OUTPUT_START---';
 const OUTPUT_END_MARKER = '---NANOCLAW_OUTPUT_END---';
 const IPC_INPUT_DIR = '/workspace/ipc/input';
 const IPC_INPUT_CLOSE_SENTINEL = path.join(IPC_INPUT_DIR, '_close');
+const HOST_TOOL_REQUEST_DIR = '/workspace/ipc/host-tools/requests';
+const HOST_TOOL_RESULT_DIR = '/workspace/ipc/host-tools/results';
 const IPC_POLL_MS = 500;
 const SESSION_DIR = '/workspace/group/.nanoclaw-ollama';
 const DEFAULT_OLLAMA_HOSTS = [
@@ -62,9 +77,13 @@ const DEFAULT_OLLAMA_HOSTS = [
 ];
 const MAX_TOOL_STEPS = 4;
 const INTERNET_REQUEST_PATTERN =
-  /\b(search|latest|today|current|news|official|website|site|web|internet|online|github|docs|documentation|release|version|价格|官网|新闻|最新|搜索|查一下|搜一下|联网)\b/i;
+  /\b(search|latest|today|current|news|official|website|site|web|internet|online|github|docs|documentation|release|version|price|prices|lookup|look up|find)\b|\u4ef7\u683c|\u5b98\u7f51|\u65b0\u95fb|\u6700\u65b0|\u641c\u7d22|\u67e5\u4e00\u4e0b|\u641c\u4e00\u4e0b|\u8054\u7f51/i;
+const SCREENSHOT_REQUEST_PATTERN =
+  /(screenshot|screen shot|capture screen|take a screenshot|\u622a\u5c4f|\u622a\u56fe|\u5c4f\u5e55\u622a\u56fe|\u684c\u9762\u622a\u56fe)/i;
+const OPEN_APP_REQUEST_PATTERN =
+  /(open app|launch app|start app|open software|run app|run program|open\s+(notepad|steam|chrome|edge|calculator|calc|paint|explorer|terminal|cmd|powershell)|launch\s+(notepad|steam|chrome|edge|calculator|calc|paint|explorer|terminal|cmd|powershell)|start\s+(notepad|steam|chrome|edge|calculator|calc|paint|explorer|terminal|cmd|powershell)|\u6253\u5f00\s*(steam|Steam|\u8bb0\u4e8b\u672c|\u6d4f\u89c8\u5668|\u8ba1\u7b97\u5668|\u7ec8\u7aef|cmd|powershell)|\u542f\u52a8\s*(steam|Steam|\u8bb0\u4e8b\u672c|\u6d4f\u89c8\u5668|\u8ba1\u7b97\u5668|\u7ec8\u7aef|cmd|powershell)|\u8fd0\u884c\s*(steam|Steam|\u8bb0\u4e8b\u672c|\u6d4f\u89c8\u5668|\u8ba1\u7b97\u5668|\u7ec8\u7aef|cmd|powershell))/i;
 const STALE_LIMITATION_PATTERN =
-  /without Claude Code, external APIs, or remote tools|cannot access real[- ]?time network|do not have web search|cannot browse the web|as of 2024/i;
+  /without Claude Code, external APIs, or remote tools|cannot access real[- ]?time network|do not have web search|cannot browse the web|as of 2024|repeat my final answer|repeat the final answer|previous answer to repeat|there's no previous conversation|there is no previous conversation|The user is asking me to repeat/i;
 
 function log(message: string): void {
   console.error(`[ollama-runner] ${message}`);
@@ -182,10 +201,11 @@ function buildSystemPrompt(input: ContainerInput): string {
   parts.push(
     `You are ${assistantName}, a local NanoClaw assistant powered only by Ollama.`,
     'You are running without Claude Code or Anthropic services.',
-    'You may use two built-in internet tools when fresh online information would help: web_search and web_fetch.',
+    'You may use four built-in tools when they help: web_search, web_fetch, open_app, and take_screenshot.',
     'web_search uses a real browser to search the web. web_fetch uses a real browser to open a page and extract readable content.',
+    'open_app asks the host OS to open a desktop application by name or path. take_screenshot asks the host OS to capture the current desktop and returns the saved file path.',
     'If you want to use a tool, reply with ONLY compact JSON and no markdown fences.',
-    'Tool call format: {"tool":"web_search","input":{"query":"..."}} or {"tool":"web_fetch","input":{"url":"https://..."}}.',
+    'Tool call format: {"tool":"web_search","input":{"query":"..."}}, {"tool":"web_fetch","input":{"url":"https://..."}}, {"tool":"open_app","input":{"app":"Notepad"}}, or {"tool":"take_screenshot","input":{}}.',
     'Only call one tool at a time. After you receive tool output, continue reasoning and either call another tool or provide the final answer normally.',
     'If you already have enough information, answer normally and do not emit JSON.',
     'If the user asks for fresh facts, search results, prices, release info, docs, websites, GitHub links, news, or anything likely to change, prefer using the internet tools instead of answering from stale memory.',
@@ -194,6 +214,7 @@ function buildSystemPrompt(input: ContainerInput): string {
     'If the user explicitly asks to only return a URL, name, version, or another minimal format, follow that output format and omit extra prose.',
     'Be honest about limitations. Do not claim to have executed commands or modified files unless the host explicitly did so outside this model.',
     'Reply in the same language as the user when practical, and keep answers useful and direct.',
+    'If the prompt includes <client channel="web" ...>, markdown is allowed. When take_screenshot returns SCREENSHOT_URL, you may include a markdown image using that URL if the user asked to see the screenshot.',
   );
 
   const envPrompt = (process.env.OLLAMA_SYSTEM_PROMPT || '').trim();
@@ -215,7 +236,15 @@ function buildSystemPrompt(input: ContainerInput): string {
 }
 
 function isLikelyInternetRequest(prompt: string): boolean {
-  return INTERNET_REQUEST_PATTERN.test(prompt);
+  return INTERNET_REQUEST_PATTERN.test(extractLatestUserText(prompt));
+}
+
+function isLikelyScreenshotRequest(prompt: string): boolean {
+  return SCREENSHOT_REQUEST_PATTERN.test(extractLatestUserText(prompt));
+}
+
+function isLikelyOpenAppRequest(prompt: string): boolean {
+  return OPEN_APP_REQUEST_PATTERN.test(extractLatestUserText(prompt));
 }
 
 function decodeXmlEntities(value: string): string {
@@ -226,15 +255,46 @@ function decodeXmlEntities(value: string): string {
     .replace(/&amp;/g, '&');
 }
 
-function buildAutomaticSearchQuery(prompt: string): string {
+function extractLatestUserText(prompt: string): string {
   const matches = [...prompt.matchAll(/<message\s+[^>]*>([\s\S]*?)<\/message>/g)];
   const latestMessage = matches.length > 0 ? matches[matches.length - 1][1] : '';
-  const candidate = decodeXmlEntities(latestMessage || prompt)
+  return decodeXmlEntities(latestMessage || prompt)
     .replace(/<[^>]+>/g, ' ')
     .replace(/\s+/g, ' ')
     .trim();
+}
 
-  return candidate.slice(0, 240);
+function buildAutomaticSearchQuery(prompt: string): string {
+  return extractLatestUserText(prompt).slice(0, 240);
+}
+
+function buildAutomaticOpenAppName(prompt: string): string {
+  const latest = extractLatestUserText(prompt);
+  if (/steam|\u84b8\u6c7d\u5e73\u53f0/i.test(latest)) return 'Steam';
+  if (/notepad|\u8bb0\u4e8b\u672c/i.test(latest)) return 'notepad.exe';
+  if (/browser|chrome|edge|\u6d4f\u89c8\u5668/i.test(latest)) return 'msedge.exe';
+  if (/calculator|calc|\u8ba1\u7b97\u5668/i.test(latest)) return 'calc.exe';
+  if (/powershell/i.test(latest)) return 'powershell.exe';
+  if (/cmd|command prompt|\u547d\u4ee4\u63d0\u793a\u7b26/i.test(latest)) return 'cmd.exe';
+  return latest.slice(0, 120);
+}
+
+function normalizeFirstToolCall(prompt: string, toolCall: ToolCall): ToolCall {
+  if (isLikelyOpenAppRequest(prompt) && toolCall.tool !== 'open_app') {
+    return {
+      tool: 'open_app',
+      input: { app: buildAutomaticOpenAppName(prompt) },
+    };
+  }
+
+  if (isLikelyScreenshotRequest(prompt) && toolCall.tool !== 'take_screenshot') {
+    return {
+      tool: 'take_screenshot',
+      input: {},
+    };
+  }
+
+  return toolCall;
 }
 
 function shouldClose(): boolean {
@@ -312,7 +372,12 @@ function parseToolCall(text: string): ToolCall | null {
   try {
     const parsed = JSON.parse(withoutFences) as ToolCall;
     if (!parsed || typeof parsed !== 'object') return null;
-    if (parsed.tool !== 'web_search' && parsed.tool !== 'web_fetch') return null;
+    if (
+      parsed.tool !== 'web_search' &&
+      parsed.tool !== 'web_fetch' &&
+      parsed.tool !== 'open_app' &&
+      parsed.tool !== 'take_screenshot'
+    ) return null;
     if (!parsed.input || typeof parsed.input !== 'object') return null;
     return parsed;
   } catch {
@@ -320,11 +385,133 @@ function parseToolCall(text: string): ToolCall | null {
   }
 }
 
+function writeHostToolRequest(call: ToolCall): string {
+  fs.mkdirSync(HOST_TOOL_REQUEST_DIR, { recursive: true });
+  fs.mkdirSync(HOST_TOOL_RESULT_DIR, { recursive: true });
+  const id = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const payload = {
+    id,
+    type: call.tool,
+    app: call.input.app,
+    timestamp: new Date().toISOString(),
+  };
+  fs.writeFileSync(
+    path.join(HOST_TOOL_REQUEST_DIR, `${id}.json`),
+    JSON.stringify(payload, null, 2),
+  );
+  return id;
+}
+
+async function waitForHostToolResult(id: string): Promise<HostToolResult> {
+  const resultPath = path.join(HOST_TOOL_RESULT_DIR, `${id}.json`);
+  const timeoutAt = Date.now() + 30000;
+
+  while (Date.now() < timeoutAt) {
+    if (fs.existsSync(resultPath)) {
+      try {
+        const parsed = JSON.parse(
+          fs.readFileSync(resultPath, 'utf8'),
+        ) as HostToolResult;
+        fs.unlinkSync(resultPath);
+        return parsed;
+      } catch (err) {
+        throw new Error('Failed to parse host tool result: ' + (err instanceof Error ? err.message : String(err)));
+      }
+    }
+    await new Promise((resolve) => setTimeout(resolve, 200));
+  }
+
+  throw new Error('Host tool timed out');
+}
+
+async function executeHostTool(call: ToolCall): Promise<ExecutedHostToolResult> {
+  const requestId = writeHostToolRequest(call);
+  const result = await waitForHostToolResult(requestId);
+  if (!result.ok) {
+    throw new Error(result.message || ('Host tool failed: ' + call.tool));
+  }
+
+  if (call.tool === 'take_screenshot') {
+    return {
+      raw: result,
+      summary: [
+        'HOST_SCREENSHOT_OK',
+        'MESSAGE: ' + result.message,
+        result.screenshotPath ? 'SCREENSHOT_PATH: ' + result.screenshotPath : '',
+        result.screenshotUrl ? 'SCREENSHOT_URL: ' + result.screenshotUrl : '',
+      ]
+        .filter(Boolean)
+        .join('\n'),
+    };
+  }
+
+  return {
+    raw: result,
+    summary: 'HOST_ACTION_OK\nMESSAGE: ' + result.message,
+  };
+}
+
+function hasChinese(text: string): boolean {
+  return /[\u3400-\u9fff]/.test(text);
+}
+
+async function finalizeDirectHostAction(
+  input: ContainerInput,
+  sessionId: string,
+  history: ConversationMessage[],
+  systemPrompt: string,
+  prompt: string,
+  reply: string,
+  onStream?: (chunk: StreamToken) => void | Promise<void>,
+): Promise<string> {
+  if (onStream) {
+    await onStream({ kind: 'content', value: reply });
+  }
+
+  const finalMessages = trimHistory([
+    { role: 'system', content: systemPrompt },
+    ...history,
+    { role: 'user', content: prompt },
+    { role: 'assistant', content: reply },
+  ]);
+  saveHistory(sessionId, finalMessages);
+  return reply;
+}
+
+function buildDirectHostActionReply(
+  call: ToolCall,
+  result: ExecutedHostToolResult,
+  prompt: string,
+  input: ContainerInput,
+): string {
+  const prefersChinese = hasChinese(prompt);
+  const isWebClient = prompt.includes('<client channel="web"');
+
+  if (call.tool === 'take_screenshot') {
+    const intro = prefersChinese
+      ? '\u597d\u7684\uff0c\u622a\u56fe\u5df2\u6210\u529f\u6355\u83b7\uff01'
+      : 'Done. I captured the screenshot successfully.';
+    const imageLine = isWebClient && result.raw.screenshotUrl
+      ? `\n\n![Screenshot](${result.raw.screenshotUrl})`
+      : '';
+    return intro + imageLine;
+  }
+
+  const appName = call.input.app || (prefersChinese ? '\u76ee\u6807\u5e94\u7528' : 'the requested app');
+  return prefersChinese
+    ? `\u597d\u7684\uff0c\u5df2\u7ecf\u5c1d\u8bd5\u4e3a\u4f60\u6253\u5f00 ${appName}\u3002`
+    : `Done. I attempted to open ${appName}.`;
+}
+
 async function executeToolCall(call: ToolCall): Promise<string> {
   if (call.tool === 'web_search') {
     return webSearch(call.input.query || '');
   }
-  return webFetch(call.input.url || '');
+  if (call.tool === 'web_fetch') {
+    return webFetch(call.input.url || '');
+  }
+  const hostResult = await executeHostTool(call);
+  return hostResult.summary;
 }
 
 async function askModel(messages: ConversationMessage[]): Promise<{
@@ -384,6 +571,9 @@ async function askModel(messages: ConversationMessage[]): Promise<{
 async function streamModelAnswer(
   messages: ConversationMessage[],
   onToken: (token: StreamToken) => void | Promise<void>,
+  options?: {
+    includeThinking?: boolean;
+  },
 ): Promise<{ text: string; host: string; model: string }> {
   const model = (process.env.OLLAMA_MODEL || '').trim();
   if (!model) {
@@ -412,6 +602,7 @@ async function streamModelAnswer(
     throw new Error(`Ollama stream error from ${host} (${response.status}): ${errorText}`);
   }
 
+  const includeThinking = options?.includeThinking ?? true;
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
   let buffer = '';
@@ -431,7 +622,7 @@ async function streamModelAnswer(
         done?: boolean;
       };
       const thinkingToken = data.message?.thinking || '';
-      if (thinkingToken) {
+      if (thinkingToken && includeThinking) {
         await onToken({ kind: 'thinking', value: thinkingToken });
       }
       const contentToken = data.message?.content || '';
@@ -447,7 +638,7 @@ async function streamModelAnswer(
           message?: { content?: string; thinking?: string };
         };
         const thinkingToken = data.message?.thinking || '';
-        if (thinkingToken) {
+        if (thinkingToken && includeThinking) {
           await onToken({ kind: 'thinking', value: thinkingToken });
         }
         const contentToken = data.message?.content || '';
@@ -479,6 +670,29 @@ async function generateReply(
     { role: 'user', content: prompt },
   ];
 
+  if (isLikelyScreenshotRequest(prompt)) {
+    log('Direct host-action shortcut matched screenshot request');
+    const call = {
+      tool: 'take_screenshot',
+      input: {},
+    } as ToolCall;
+    const hostResult = await executeHostTool(call);
+    const reply = buildDirectHostActionReply(call, hostResult, prompt, input);
+    return finalizeDirectHostAction(input, sessionId, history, systemPrompt, prompt, reply, onStream);
+  }
+
+  if (isLikelyOpenAppRequest(prompt)) {
+    const appName = buildAutomaticOpenAppName(prompt);
+    log(`Direct host-action shortcut matched app launch request: ${appName}`);
+    const call = {
+      tool: 'open_app',
+      input: { app: appName },
+    } as ToolCall;
+    const hostResult = await executeHostTool(call);
+    const reply = buildDirectHostActionReply(call, hostResult, prompt, input);
+    return finalizeDirectHostAction(input, sessionId, history, systemPrompt, prompt, reply, onStream);
+  }
+
   if (isLikelyInternetRequest(prompt)) {
     messages.splice(1, 0, {
       role: 'system',
@@ -494,7 +708,34 @@ async function generateReply(
     );
 
     const toolCall = parseToolCall(result.text);
-    if (!toolCall) {
+    const effectiveToolCall = toolCall && step === 0
+      ? normalizeFirstToolCall(prompt, toolCall)
+      : toolCall;
+
+    if (!effectiveToolCall) {
+      if (step === 0 && isLikelyScreenshotRequest(prompt)) {
+        log('No tool call emitted for likely screenshot request, auto-running take_screenshot');
+        const call = {
+          tool: 'take_screenshot',
+          input: {},
+        } as ToolCall;
+        const hostResult = await executeHostTool(call);
+        const reply = buildDirectHostActionReply(call, hostResult, prompt, input);
+        return finalizeDirectHostAction(input, sessionId, history, systemPrompt, prompt, reply, onStream);
+      }
+
+      if (step === 0 && isLikelyOpenAppRequest(prompt)) {
+        const appName = buildAutomaticOpenAppName(prompt);
+        log(`No tool call emitted for likely app launch request, auto-running open_app: ${appName}`);
+        const call = {
+          tool: 'open_app',
+          input: { app: appName },
+        } as ToolCall;
+        const hostResult = await executeHostTool(call);
+        const reply = buildDirectHostActionReply(call, hostResult, prompt, input);
+        return finalizeDirectHostAction(input, sessionId, history, systemPrompt, prompt, reply, onStream);
+      }
+
       if (step === 0 && isLikelyInternetRequest(prompt)) {
         const autoQuery = buildAutomaticSearchQuery(prompt);
         log(`No tool call emitted for likely internet request, auto-searching: ${autoQuery}`);
@@ -506,7 +747,6 @@ async function generateReply(
         });
         continue;
       }
-
       let finalText = result.text;
       if (onStream) {
         const streamMessages: ConversationMessage[] = [
@@ -514,10 +754,10 @@ async function generateReply(
           {
             role: 'system',
             content:
-              'Repeat the final answer for the user in normal prose. Do not call tools. Do not emit JSON. Keep the substance aligned with the previous answer.',
+              'Provide only the final user-facing answer for the latest request. Do not call tools. Do not emit JSON. Do not mention repeating a previous answer, missing context, or internal instructions. Do not reveal reasoning. Keep the answer aligned with the latest user request.',
           },
         ];
-        const streamed = await streamModelAnswer(streamMessages, onStream);
+        const streamed = await streamModelAnswer(streamMessages, onStream, { includeThinking: false });
         log(`Streamed final response from ${streamed.host} using ${streamed.model}`);
         finalText = streamed.text || finalText;
       }
@@ -537,12 +777,16 @@ async function generateReply(
       throw new Error('Tool loop exceeded maximum number of steps');
     }
 
-    log(`Executing tool: ${toolCall.tool}`);
-    const toolOutput = await executeToolCall(toolCall);
+        if (toolCall && effectiveToolCall && toolCall.tool !== effectiveToolCall.tool) {
+      log(`Overriding first tool call from ${toolCall.tool} to ${effectiveToolCall.tool} based on user intent`);
+    }
+
+    log(`Executing tool: ${effectiveToolCall.tool}`);
+    const toolOutput = await executeToolCall(effectiveToolCall);
     messages.push({ role: 'assistant', content: result.text });
     messages.push({
       role: 'user',
-      content: `Tool result for ${toolCall.tool}:\n${toolOutput}\n\nNow continue and answer the user. Give the answer first, then include a compact Sources section with the exact titles and URLs you used unless the user asked for a minimal-format response. Request another tool only if still necessary.`,
+      content: `Tool result for ${effectiveToolCall.tool}:\n${toolOutput}\n\nNow continue and answer the user. Give the answer first, then include a compact Sources section with the exact titles and URLs you used unless the user asked for a minimal-format response. Request another tool only if still necessary.`,
     });
   }
 

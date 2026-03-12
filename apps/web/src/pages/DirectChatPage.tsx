@@ -1,5 +1,6 @@
 ﻿import { FormEvent, KeyboardEvent, useEffect, useMemo, useRef, useState } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
+import { Image } from 'antd';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 
@@ -32,6 +33,22 @@ function parseAssistantMessage(content: string): ParsedAssistantMessage {
   return {
     thinking: thinking.trim(),
     reply: reply.trim(),
+  };
+}
+
+function markdownComponents() {
+  return {
+    a: ({ node, ...props }: any) => (
+      <a {...props} target="_blank" rel="noreferrer noopener" />
+    ),
+    img: ({ node, src, alt, ...props }: any) => (
+      <Image
+        className="chat-image"
+        src={src}
+        alt={alt || '聊天图片'}
+        {...props}
+      />
+    ),
   };
 }
 
@@ -79,7 +96,7 @@ function AssistantMessageBubble({
           </button>
           {thinkingOpen && (
             <div className="thinking-body markdown-body">
-              <ReactMarkdown remarkPlugins={[remarkGfm]}>
+              <ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownComponents()}>
                 {content.thinking}
               </ReactMarkdown>
             </div>
@@ -87,14 +104,7 @@ function AssistantMessageBubble({
         </section>
       )}
       <div className="markdown-body">
-        <ReactMarkdown
-          remarkPlugins={[remarkGfm]}
-          components={{
-            a: ({ node, ...props }) => (
-              <a {...props} target="_blank" rel="noreferrer noopener" />
-            ),
-          }}
-        >
+        <ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownComponents()}>
           {content.reply || '处理中，请稍候...'}
         </ReactMarkdown>
       </div>
@@ -108,6 +118,7 @@ export function DirectChatPage() {
   const [streamState, setStreamState] = useState<StreamState | null>(null);
   const [streamError, setStreamError] = useState<string>('');
   const [isStreaming, setIsStreaming] = useState(false);
+  const [isClearing, setIsClearing] = useState(false);
   const bottomRef = useRef<HTMLDivElement | null>(null);
 
   const messages = useQuery({
@@ -194,7 +205,7 @@ export function DirectChatPage() {
   async function onSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const trimmed = message.trim();
-    if (!trimmed || isStreaming) return;
+    if (!trimmed || isStreaming || isClearing) return;
 
     setMessage('');
     setStreamError('');
@@ -218,6 +229,27 @@ export function DirectChatPage() {
     }
   }
 
+  async function onClearHistory() {
+    if (isStreaming || isClearing) return;
+    const confirmed = window.confirm('确定要清空当前 Web 直聊的全部聊天记录吗？这会同时重置本地会话上下文。');
+    if (!confirmed) return;
+
+    setStreamError('');
+    setIsClearing(true);
+    setStreamState(null);
+
+    try {
+      await api.clearDirectMessages();
+      await queryClient.invalidateQueries({ queryKey: ['direct-messages'] });
+      await queryClient.invalidateQueries({ queryKey: ['summary'] });
+      await queryClient.invalidateQueries({ queryKey: ['chats'] });
+    } catch (error) {
+      setStreamError(error instanceof Error ? error.message : '清空失败');
+    } finally {
+      setIsClearing(false);
+    }
+  }
+
   function onKeyDown(event: KeyboardEvent<HTMLTextAreaElement>) {
     if (event.key === 'Enter' && !event.shiftKey) {
       event.preventDefault();
@@ -236,6 +268,14 @@ export function DirectChatPage() {
           <h2>直接对话</h2>
           <p className="muted">不经过 Telegram，直接在 Web 控制台里与 NanoClaw 对话</p>
         </div>
+        <button
+          className="ghost-button danger"
+          type="button"
+          onClick={onClearHistory}
+          disabled={isStreaming || isClearing || messages.isLoading || !messages.data?.length}
+        >
+          {isClearing ? '清空中...' : '清空聊天记录'}
+        </button>
       </div>
 
       <section className="panel chat-panel">
@@ -303,7 +343,7 @@ export function DirectChatPage() {
           />
           <div className="chat-composer-footer">
             <span className="muted">发送时会附带当前浏览器 userAgent，帮助 NanoClaw 识别你的系统环境。</span>
-            <button type="submit" disabled={isStreaming || !message.trim()}>
+            <button type="submit" disabled={isStreaming || isClearing || !message.trim()}>
               {isStreaming ? '回复中...' : '发送'}
             </button>
           </div>
@@ -313,4 +353,3 @@ export function DirectChatPage() {
     </section>
   );
 }
-

@@ -8,6 +8,7 @@ import { AvailableGroup } from './container-runner.js';
 import { createTask, deleteTask, getTaskById, updateTask } from './db.js';
 import { isValidGroupFolder } from './group-folder.js';
 import { logger } from './logger.js';
+import { runHostTool } from './host-tools.js';
 import { RegisteredGroup } from './types.js';
 
 export interface IpcDeps {
@@ -111,6 +112,70 @@ export function startIpcWatcher(deps: IpcDeps): void {
         logger.error(
           { err, sourceGroup },
           'Error reading IPC messages directory',
+        );
+      }
+
+      // Process host tool requests from this group's IPC directory
+      try {
+        const hostToolsRequestsDir = path.join(
+          ipcBaseDir,
+          sourceGroup,
+          'host-tools',
+          'requests',
+        );
+        const hostToolsResultsDir = path.join(
+          ipcBaseDir,
+          sourceGroup,
+          'host-tools',
+          'results',
+        );
+        fs.mkdirSync(hostToolsResultsDir, { recursive: true });
+
+        if (fs.existsSync(hostToolsRequestsDir)) {
+          const requestFiles = fs
+            .readdirSync(hostToolsRequestsDir)
+            .filter((f) => f.endsWith('.json'));
+          for (const file of requestFiles) {
+            const filePath = path.join(hostToolsRequestsDir, file);
+            const resultPath = path.join(hostToolsResultsDir, file);
+            try {
+              const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
+              const result = await runHostTool(data);
+              fs.writeFileSync(resultPath, JSON.stringify(result, null, 2));
+              fs.unlinkSync(filePath);
+              logger.info(
+                { sourceGroup, tool: data.type, ok: result.ok },
+                'Host tool request processed',
+              );
+            } catch (err) {
+              logger.error(
+                { file, sourceGroup, err },
+                'Error processing host tool request',
+              );
+              fs.writeFileSync(
+                resultPath,
+                JSON.stringify(
+                  {
+                    ok: false,
+                    message:
+                      err instanceof Error ? err.message : String(err),
+                  },
+                  null,
+                  2,
+                ),
+              );
+              try {
+                fs.unlinkSync(filePath);
+              } catch {
+                // Ignore cleanup failures.
+              }
+            }
+          }
+        }
+      } catch (err) {
+        logger.error(
+          { err, sourceGroup },
+          'Error reading host tools directory',
         );
       }
 

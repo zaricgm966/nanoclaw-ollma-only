@@ -145,6 +145,9 @@ export const api = {
   tasks: () => apiFetch<TaskInfo[]>('/api/tasks'),
   groups: () => apiFetch<GroupInfo[]>('/api/groups'),
   directMessages: () => apiFetch<MessageInfo[]>('/api/direct-chat/messages?limit=120'),
+  clearDirectMessages: () => apiFetch<{ ok: boolean }>('/api/direct-chat/messages', {
+    method: 'DELETE',
+  }),
   sendDirectMessage: ({ message, userAgent }: DirectChatRequest) => apiFetch<DirectChatReply>('/api/direct-chat', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },

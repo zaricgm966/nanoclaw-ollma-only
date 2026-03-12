@@ -23,6 +23,8 @@ import {
   getAllChats,
   getAllTasks,
   getMessagesSince,
+  clearChatHistory,
+  deleteSession,
   getRecentMessages,
   setSession,
   storeChatMetadata,
@@ -74,8 +76,23 @@ interface DirectChatRunOptions {
   }) => void | Promise<void>;
 }
 
-const DIRECT_CHAT_STALE_ASSISTANT_PATTERN =
-  /User-Agent|DuckDuckGo's homepage|search results only show|Could you please clarify what you'd like me to help you with/i;
+const DIRECT_CHAT_STALE_ASSISTANT_PATTERN = new RegExp(
+  [
+    'User-Agent',
+    "DuckDuckGo's homepage",
+    'search results only show',
+    "Could you please clarify what you'd like me to help you with",
+    '\\?{6,}',
+    'I cannot directly operate or open your local software',
+    '\u65e0\u6cd5\u76f4\u63a5\u64cd\u4f5c\u6216\u6253\u5f00\u4f60\u7684\u672c\u5730\u8f6f\u4ef6',
+    'repeat my final answer',
+    'repeat the final answer',
+    "there's no previous conversation",
+    'there is no previous conversation',
+    'The user is asking me to repeat',
+  ].join('|'),
+  'i',
+);
 
 const WEB_DIST_DIR = path.resolve(process.cwd(), 'apps', 'web', 'dist');
 const DIRECT_CHAT_JID = 'web:direct';
@@ -299,6 +316,18 @@ function writeNdjson(res: ServerResponse, payload: unknown): void {
   res.write(`${JSON.stringify(payload)}\n`);
 }
 
+function clearDirectChatState(options: WebServerOptions): void {
+  clearChatHistory(DIRECT_CHAT_JID);
+  deleteSession(DIRECT_GROUP_FOLDER);
+  delete options.sessions()[DIRECT_GROUP_FOLDER];
+
+  const groupDir = resolveGroupFolderPath(DIRECT_GROUP_FOLDER);
+  const sessionDir = path.join(groupDir, '.nanoclaw-ollama');
+  if (fs.existsSync(sessionDir)) {
+    fs.rmSync(sessionDir, { recursive: true, force: true });
+  }
+}
+
 async function runDirectChatTurn(
   options: WebServerOptions,
   body: DirectChatPayload,
@@ -469,6 +498,19 @@ async function handleDirectChat(
   }
 }
 
+async function handleDirectChatClear(
+  res: ServerResponse,
+  options: WebServerOptions,
+): Promise<void> {
+  try {
+    clearDirectChatState(options);
+    sendJson(res, 200, { ok: true });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    sendJson(res, 500, { error: 'direct_chat_clear_failed', message });
+  }
+}
+
 async function handleDirectChatStream(
   req: IncomingMessage,
   res: ServerResponse,
@@ -576,6 +618,11 @@ export function startWebServer(options: WebServerOptions): Promise<void> {
       return;
     }
 
+    if (method === 'DELETE' && pathname === '/api/direct-chat/messages') {
+      await handleDirectChatClear(res, options);
+      return;
+    }
+
     if (method !== 'GET') {
       sendMethodNotAllowed(res);
       return;
@@ -679,6 +726,20 @@ export function startWebServer(options: WebServerOptions): Promise<void> {
 
     if (pathname === '/api/sessions') {
       sendJson(res, 200, options.sessions());
+      return;
+    }
+
+    if (pathname.startsWith('/api/screenshots/')) {
+      const fileName = path.basename(pathname.replace('/api/screenshots/', ''));
+      const screenshotsDir = path.join(process.cwd(), 'store', 'screenshots');
+      const screenshotPath = path.join(screenshotsDir, fileName);
+      if (!fs.existsSync(screenshotPath) || !fs.statSync(screenshotPath).isFile()) {
+        sendNotFound(res);
+        return;
+      }
+      res.statusCode = 200;
+      res.setHeader('Content-Type', 'image/png');
+      res.end(fs.readFileSync(screenshotPath));
       return;
     }
 
