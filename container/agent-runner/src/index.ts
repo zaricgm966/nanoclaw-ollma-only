@@ -26,7 +26,13 @@ interface ContainerOutput {
   newSessionId?: string;
   error?: string;
   stream?: boolean;
+  streamKind?: 'thinking' | 'content';
   done?: boolean;
+}
+
+interface StreamToken {
+  kind: 'thinking' | 'content';
+  value: string;
 }
 
 interface ConversationMessage {
@@ -377,7 +383,7 @@ async function askModel(messages: ConversationMessage[]): Promise<{
 
 async function streamModelAnswer(
   messages: ConversationMessage[],
-  onToken: (token: string) => void | Promise<void>,
+  onToken: (token: StreamToken) => void | Promise<void>,
 ): Promise<{ text: string; host: string; model: string }> {
   const model = (process.env.OLLAMA_MODEL || '').trim();
   if (!model) {
@@ -421,25 +427,33 @@ async function streamModelAnswer(
       const trimmed = line.trim();
       if (!trimmed) continue;
       const data = JSON.parse(trimmed) as {
-        message?: { content?: string };
+        message?: { content?: string; thinking?: string };
         done?: boolean;
       };
-      const token = data.message?.content || '';
-      if (token) {
-        text += token;
-        await onToken(token);
+      const thinkingToken = data.message?.thinking || '';
+      if (thinkingToken) {
+        await onToken({ kind: 'thinking', value: thinkingToken });
+      }
+      const contentToken = data.message?.content || '';
+      if (contentToken) {
+        text += contentToken;
+        await onToken({ kind: 'content', value: contentToken });
       }
     }
 
     if (done) {
       if (buffer.trim()) {
         const data = JSON.parse(buffer.trim()) as {
-          message?: { content?: string };
+          message?: { content?: string; thinking?: string };
         };
-        const token = data.message?.content || '';
-        if (token) {
-          text += token;
-          await onToken(token);
+        const thinkingToken = data.message?.thinking || '';
+        if (thinkingToken) {
+          await onToken({ kind: 'thinking', value: thinkingToken });
+        }
+        const contentToken = data.message?.content || '';
+        if (contentToken) {
+          text += contentToken;
+          await onToken({ kind: 'content', value: contentToken });
         }
       }
       break;
@@ -453,7 +467,7 @@ async function generateReply(
   input: ContainerInput,
   sessionId: string,
   prompt: string,
-  onStream?: (chunk: string) => void | Promise<void>,
+  onStream?: (chunk: StreamToken) => void | Promise<void>,
 ): Promise<string> {
   const history = sanitizeHistory(loadHistory(sessionId)).filter(
     (message) => message.role !== 'system',
@@ -580,9 +594,10 @@ async function main(): Promise<void> {
           ? async (chunk) => {
               writeOutput({
                 status: 'success',
-                result: chunk,
+                result: chunk.value,
                 newSessionId: sessionId,
                 stream: true,
+                streamKind: chunk.kind,
                 done: false,
               });
             }

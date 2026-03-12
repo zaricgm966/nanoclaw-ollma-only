@@ -47,6 +47,7 @@ export interface ContainerOutput {
   newSessionId?: string;
   error?: string;
   stream?: boolean;
+  streamKind?: 'thinking' | 'content';
   done?: boolean;
 }
 

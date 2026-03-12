@@ -8,6 +8,98 @@ import { api } from '../api';
 interface StreamState {
   userMessage: string;
   assistantReply: string;
+  assistantThinking: string;
+}
+
+interface ParsedAssistantMessage {
+  thinking: string;
+  reply: string;
+}
+
+const THINKING_MARKER = '[[[NANOCLAW_THINKING]]]';
+const REPLY_MARKER = '[[[NANOCLAW_REPLY]]]';
+
+function parseAssistantMessage(content: string): ParsedAssistantMessage {
+  if (!content.includes(REPLY_MARKER)) {
+    return { thinking: '', reply: content };
+  }
+
+  const thinking = content.includes(THINKING_MARKER)
+    ? content.split(THINKING_MARKER)[1]?.split(REPLY_MARKER)[0] || ''
+    : '';
+  const reply = content.split(REPLY_MARKER)[1] || '';
+
+  return {
+    thinking: thinking.trim(),
+    reply: reply.trim(),
+  };
+}
+
+function AssistantMessageBubble({
+  senderName,
+  timestampLabel,
+  content,
+  pending = false,
+  defaultThinkingOpen = false,
+}: {
+  senderName: string;
+  timestampLabel: string;
+  content: ParsedAssistantMessage;
+  pending?: boolean;
+  defaultThinkingOpen?: boolean;
+}) {
+  const hasThinking = Boolean(content.thinking);
+  const [thinkingOpen, setThinkingOpen] = useState(defaultThinkingOpen || pending);
+
+  useEffect(() => {
+    if (pending && hasThinking) {
+      setThinkingOpen(true);
+      return;
+    }
+    if (!pending && hasThinking) {
+      setThinkingOpen(defaultThinkingOpen);
+    }
+  }, [defaultThinkingOpen, hasThinking, pending, content.thinking]);
+
+  return (
+    <article className={`chat-bubble assistant ${pending ? 'pending' : ''}`}>
+      <div className="chat-bubble-meta">
+        <strong>{senderName}</strong>
+        <span>{timestampLabel}</span>
+      </div>
+      {hasThinking && (
+        <section className="thinking-panel">
+          <button
+            className="thinking-toggle"
+            type="button"
+            onClick={() => setThinkingOpen((current) => !current)}
+          >
+            <span className="thinking-label">思考过程</span>
+            <span className="thinking-state">{thinkingOpen ? '收起' : '展开'}</span>
+          </button>
+          {thinkingOpen && (
+            <div className="thinking-body markdown-body">
+              <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                {content.thinking}
+              </ReactMarkdown>
+            </div>
+          )}
+        </section>
+      )}
+      <div className="markdown-body">
+        <ReactMarkdown
+          remarkPlugins={[remarkGfm]}
+          components={{
+            a: ({ node, ...props }) => (
+              <a {...props} target="_blank" rel="noreferrer noopener" />
+            ),
+          }}
+        >
+          {content.reply || '处理中，请稍候...'}
+        </ReactMarkdown>
+      </div>
+    </article>
+  );
 }
 
 export function DirectChatPage() {
@@ -68,10 +160,19 @@ export function DirectChatPage() {
         const trimmed = line.trim();
         if (!trimmed) continue;
         const payload = JSON.parse(trimmed) as {
-          type: 'start' | 'chunk' | 'done' | 'error';
+          type: 'start' | 'thinking' | 'chunk' | 'done' | 'error';
           value?: string;
           message?: string;
         };
+
+        if (payload.type === 'thinking') {
+          setStreamState((current) => current
+            ? {
+                ...current,
+                assistantThinking: current.assistantThinking + (payload.value || ''),
+              }
+            : current);
+        }
 
         if (payload.type === 'chunk') {
           setStreamState((current) => current
@@ -98,7 +199,11 @@ export function DirectChatPage() {
     setMessage('');
     setStreamError('');
     setIsStreaming(true);
-    setStreamState({ userMessage: trimmed, assistantReply: '' });
+    setStreamState({
+      userMessage: trimmed,
+      assistantReply: '',
+      assistantThinking: '',
+    });
 
     try {
       await streamDirectReply(trimmed);
@@ -144,31 +249,23 @@ export function DirectChatPage() {
           )}
           {messages.data?.map((item) => {
             const isAssistant = item.sender === 'web:assistant' || item.is_bot_message;
-            return (
+            return isAssistant ? (
+              <AssistantMessageBubble
+                key={`${item.id}-${item.timestamp}`}
+                senderName={item.sender_name}
+                timestampLabel={new Date(item.timestamp).toLocaleString('zh-CN')}
+                content={parseAssistantMessage(item.content)}
+              />
+            ) : (
               <article
-                className={`chat-bubble ${isAssistant ? 'assistant' : 'user'}`}
+                className="chat-bubble user"
                 key={`${item.id}-${item.timestamp}`}
               >
                 <div className="chat-bubble-meta">
                   <strong>{item.sender_name}</strong>
                   <span>{new Date(item.timestamp).toLocaleString('zh-CN')}</span>
                 </div>
-                {isAssistant ? (
-                  <div className="markdown-body">
-                    <ReactMarkdown
-                      remarkPlugins={[remarkGfm]}
-                      components={{
-                        a: ({ node, ...props }) => (
-                          <a {...props} target="_blank" rel="noreferrer noopener" />
-                        ),
-                      }}
-                    >
-                      {item.content}
-                    </ReactMarkdown>
-                  </div>
-                ) : (
-                  <p>{item.content}</p>
-                )}
+                <p>{item.content}</p>
               </article>
             );
           })}
@@ -181,17 +278,16 @@ export function DirectChatPage() {
                 </div>
                 <p>{streamState.userMessage}</p>
               </article>
-              <article className="chat-bubble assistant pending">
-                <div className="chat-bubble-meta">
-                  <strong>Andy</strong>
-                  <span>{isStreaming ? '正在回复...' : '已中断'}</span>
-                </div>
-                <div className="markdown-body">
-                  <ReactMarkdown remarkPlugins={[remarkGfm]}>
-                    {streamState.assistantReply || '处理中，请稍候...'}
-                  </ReactMarkdown>
-                </div>
-              </article>
+              <AssistantMessageBubble
+                senderName="Andy"
+                timestampLabel={isStreaming ? '正在回复...' : '已中断'}
+                content={{
+                  thinking: streamState.assistantThinking,
+                  reply: streamState.assistantReply,
+                }}
+                pending
+                defaultThinkingOpen
+              />
             </>
           )}
           <div ref={bottomRef} />
@@ -217,3 +313,4 @@ export function DirectChatPage() {
     </section>
   );
 }
+

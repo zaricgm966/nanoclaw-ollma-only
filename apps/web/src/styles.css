@@ -330,6 +330,42 @@ a { color: inherit; text-decoration: none; }
   cursor: not-allowed;
 }
 
+.thinking-panel {
+  margin-bottom: 14px;
+  border: 1px solid rgba(38, 32, 25, 0.1);
+  border-radius: 16px;
+  background: rgba(29, 26, 23, 0.04);
+  overflow: hidden;
+}
+
+.thinking-toggle {
+  width: 100%;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 14px;
+  border: none;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  cursor: pointer;
+}
+
+.thinking-label {
+  font-weight: 700;
+}
+
+.thinking-state {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.thinking-body {
+  padding: 0 14px 14px;
+  color: var(--muted);
+}
+
 .markdown-body {
   line-height: 1.75;
 }

@@ -59,13 +59,19 @@ interface DirectChatPayload {
 
 interface DirectChatResult {
   reply: string;
+  thinking: string;
   timestamp: string;
   sessionId: string | null;
 }
 
+type DirectChatStreamKind = 'thinking' | 'content';
+
 interface DirectChatRunOptions {
   streamToHost?: boolean;
-  onChunk?: (chunk: string) => void | Promise<void>;
+  onChunk?: (chunk: {
+    kind: DirectChatStreamKind;
+    value: string;
+  }) => void | Promise<void>;
 }
 
 const DIRECT_CHAT_STALE_ASSISTANT_PATTERN =
@@ -74,6 +80,8 @@ const DIRECT_CHAT_STALE_ASSISTANT_PATTERN =
 const WEB_DIST_DIR = path.resolve(process.cwd(), 'apps', 'web', 'dist');
 const DIRECT_CHAT_JID = 'web:direct';
 const DIRECT_GROUP_FOLDER = 'web_console';
+const DIRECT_CHAT_THINKING_MARKER = '[[[NANOCLAW_THINKING]]]';
+const DIRECT_CHAT_REPLY_MARKER = '[[[NANOCLAW_REPLY]]]';
 const MIME_TYPES: Record<string, string> = {
   '.html': 'text/html; charset=utf-8',
   '.js': 'application/javascript; charset=utf-8',
@@ -134,16 +142,66 @@ function escapeXml(value: string): string {
     .replace(/"/g, '&quot;');
 }
 
+function parseDirectAssistantContent(content: string): {
+  thinking: string;
+  reply: string;
+} {
+  if (!content.includes(DIRECT_CHAT_REPLY_MARKER)) {
+    return { thinking: '', reply: content };
+  }
+
+  const thinkingSection = content.includes(DIRECT_CHAT_THINKING_MARKER)
+    ? content
+        .split(DIRECT_CHAT_THINKING_MARKER)[1]
+        ?.split(DIRECT_CHAT_REPLY_MARKER)[0] || ''
+    : '';
+  const replySection = content.split(DIRECT_CHAT_REPLY_MARKER)[1] || '';
+
+  return {
+    thinking: thinkingSection.trim(),
+    reply: replySection.trim(),
+  };
+}
+
+function serializeDirectAssistantContent(thinking: string, reply: string): string {
+  const trimmedThinking = thinking.trim();
+  const trimmedReply = reply.trim();
+  if (!trimmedThinking) {
+    return trimmedReply;
+  }
+
+  return [
+    DIRECT_CHAT_THINKING_MARKER,
+    trimmedThinking,
+    DIRECT_CHAT_REPLY_MARKER,
+    trimmedReply,
+  ].join('\n');
+}
+
+function stripDirectAssistantContent(content: string): string {
+  return parseDirectAssistantContent(content).reply;
+}
+
 function buildDirectChatPrompt(
   messageHistory: ReturnType<typeof getRecentMessages>,
   userAgent: string | undefined,
 ): string {
-  const sanitizedHistory = messageHistory.filter((message) => {
-    if (message.sender !== 'web:assistant' && !message.is_bot_message) {
-      return true;
-    }
-    return !DIRECT_CHAT_STALE_ASSISTANT_PATTERN.test(message.content);
-  });
+  const sanitizedHistory = messageHistory
+    .filter((message) => {
+      if (message.sender !== 'web:assistant' && !message.is_bot_message) {
+        return true;
+      }
+      return !DIRECT_CHAT_STALE_ASSISTANT_PATTERN.test(message.content);
+    })
+    .map((message) => {
+      if (message.sender !== 'web:assistant' && !message.is_bot_message) {
+        return message;
+      }
+      return {
+        ...message,
+        content: stripDirectAssistantContent(message.content),
+      };
+    });
   const basePrompt = formatMessages(sanitizedHistory, TIMEZONE);
   if (!userAgent) return basePrompt;
   const clientContext = `<client channel="web" userAgent="${escapeXml(userAgent)}" />\n`;
@@ -273,6 +331,7 @@ async function runDirectChatTurn(
   const group = buildDirectGroup();
   const sessions = options.sessions();
   let activeContainerName = '';
+  let streamedThinking = '';
   let streamedReply = '';
   let finalReply = '';
   let streamedSessionId: string | undefined;
@@ -296,8 +355,13 @@ async function runDirectChatTurn(
         streamedSessionId = chunk.newSessionId;
       }
       if (chunk.stream && chunk.result) {
-        streamedReply += chunk.result;
-        await runOptions.onChunk?.(chunk.result);
+        const streamKind = chunk.streamKind === 'thinking' ? 'thinking' : 'content';
+        if (streamKind === 'thinking') {
+          streamedThinking += chunk.result;
+        } else {
+          streamedReply += chunk.result;
+        }
+        await runOptions.onChunk?.({ kind: streamKind, value: chunk.result });
         return;
       }
       if (chunk.done && chunk.result) {
@@ -340,6 +404,10 @@ async function runDirectChatTurn(
   }
 
   const replyTimestamp = new Date().toISOString();
+  const persistedAssistantContent = serializeDirectAssistantContent(
+    streamedThinking,
+    reply,
+  );
   storeChatMetadata(
     DIRECT_CHAT_JID,
     replyTimestamp,
@@ -352,7 +420,7 @@ async function runDirectChatTurn(
     chat_jid: DIRECT_CHAT_JID,
     sender: 'web:assistant',
     sender_name: assistantName,
-    content: reply,
+    content: persistedAssistantContent,
     timestamp: replyTimestamp,
     is_from_me: true,
     is_bot_message: true,
@@ -360,6 +428,7 @@ async function runDirectChatTurn(
 
   return {
     reply,
+    thinking: streamedThinking.trim(),
     timestamp: replyTimestamp,
     sessionId: sessions[DIRECT_GROUP_FOLDER] || output.newSessionId || null,
   };
@@ -419,8 +488,11 @@ async function handleDirectChatStream(
     writeNdjson(res, { type: 'start' });
     const result = await runDirectChatTurn(options, body, {
       streamToHost: true,
-      onChunk: (chunk) => {
-        writeNdjson(res, { type: 'chunk', value: chunk });
+      onChunk: ({ kind, value }) => {
+        writeNdjson(res, {
+          type: kind === 'thinking' ? 'thinking' : 'chunk',
+          value,
+        });
       },
     });
     writeNdjson(res, { type: 'done', ...result });
