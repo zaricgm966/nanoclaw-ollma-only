@@ -109,13 +109,18 @@ async function takeScreenshot(): Promise<HostToolResult> {
   };
 }
 
-function resolveLocalSkillDir(skill: string, skillPath?: string): string | null {
+function resolveLocalSkillDir(
+  skill: string,
+  skillPath?: string,
+): string | null {
   const projectRoot = process.cwd();
   const candidates = new Set<string>();
 
   if (skillPath) {
     candidates.add(
-      path.isAbsolute(skillPath) ? skillPath : path.join(projectRoot, skillPath),
+      path.isAbsolute(skillPath)
+        ? skillPath
+        : path.join(projectRoot, skillPath),
     );
   }
 
@@ -129,7 +134,9 @@ function resolveLocalSkillDir(skill: string, skillPath?: string): string | null 
 
     for (const variant of variants) {
       candidates.add(path.join(projectRoot, '.agents', 'skills', variant));
-      candidates.add(path.join(projectRoot, '.agents', 'skills', `add-${variant}`));
+      candidates.add(
+        path.join(projectRoot, '.agents', 'skills', `add-${variant}`),
+      );
     }
   }
 
@@ -176,7 +183,11 @@ async function applySkill(
     };
   }
 
-  await runShellCommand('npx', ['tsx', 'scripts/apply-skill.ts', resolvedSkillDir]);
+  await runShellCommand('npx', [
+    'tsx',
+    'scripts/apply-skill.ts',
+    resolvedSkillDir,
+  ]);
   await runShellCommand('npm', ['run', 'build']);
 
   return {

@@ -423,7 +423,11 @@ async function runDirectChatTurn(
   }
 
   const effectiveError = terminalError || output.error || '';
-  if ((terminalStatus === 'error' || output.status !== 'success') && !streamedReply && !finalReply) {
+  if (
+    (terminalStatus === 'error' || output.status !== 'success') &&
+    !streamedReply &&
+    !finalReply
+  ) {
     logger.error(
       { error: effectiveError || output.error, userAgent },
       'Direct chat request failed',
