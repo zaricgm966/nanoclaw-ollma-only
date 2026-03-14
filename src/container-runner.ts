@@ -144,6 +144,14 @@ function buildVolumeMounts(
     readonly: false,
   });
 
+  const screenshotsDir = path.join(projectRoot, 'store', 'screenshots');
+  fs.mkdirSync(screenshotsDir, { recursive: true });
+  mounts.push({
+    hostPath: screenshotsDir,
+    containerPath: '/workspace/screenshots',
+    readonly: false,
+  });
+
   const groupIpcDir = resolveGroupIpcPath(group.folder);
   fs.mkdirSync(path.join(groupIpcDir, 'messages'), { recursive: true });
   fs.mkdirSync(path.join(groupIpcDir, 'tasks'), { recursive: true });
@@ -203,6 +211,7 @@ function readContainerEnv(): Record<string, string> {
     'OLLAMA_MODEL',
     'OLLAMA_SYSTEM_PROMPT',
     'OLLAMA_TEMPERATURE',
+    'EASTMONEY_APIKEY',
     'HTTP_PROXY',
     'HTTPS_PROXY',
     'NO_PROXY',

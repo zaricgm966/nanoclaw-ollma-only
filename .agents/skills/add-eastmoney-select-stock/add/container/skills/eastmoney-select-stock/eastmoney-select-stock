@@ -1,0 +1,379 @@
+#!/usr/bin/env node
+
+import fs from 'fs';
+import path from 'path';
+
+const API_URL = 'https://mkapi2.dfcfs.com/finskillshub/api/claw/stock-screen';
+const DEFAULT_PAGE_SIZE = 100;
+const DEFAULT_PAGE_LIMIT = 100;
+const EMPTY_RESULT_MESSAGE =
+  '\u672a\u7b5b\u5230\u7ed3\u679c\uff0c\u8bf7\u5230\u4e1c\u65b9\u8d22\u5bcc\u5999\u60f3AI\u8fdb\u884c\u9009\u80a1\u3002';
+const MARKET_LABELS = '\u0041\u80a1|\u6e2f\u80a1|\u7f8e\u80a1';
+
+const LABELS = {
+  title: '\u4e1c\u65b9\u8d22\u5bcc\u667a\u80fd\u9009\u80a1\u7ed3\u679c\u8bf4\u660e',
+  originalKeyword: '\u539f\u59cb\u67e5\u8be2',
+  finalKeyword: '\u5b9e\u9645\u8bf7\u6c42',
+  total: '\u603b\u7ed3\u679c\u6570',
+  totalRecordCount: '\u603b\u8bb0\u5f55\u6570',
+  pagesFetched: '\u5df2\u6293\u53d6\u9875\u6570',
+  exportedAt: '\u5bfc\u51fa\u65f6\u95f4',
+  parsedConditions: '\u6761\u4ef6\u89e3\u6790',
+  totalCondition: '\u7ec4\u5408\u6761\u4ef6',
+  conditionDescription: '\u63cf\u8ff0',
+  conditionHitCount: '\u547d\u4e2d\u6570\u91cf',
+  singleConditions: '\u5355\u6761\u4ef6\u7edf\u8ba1',
+  columns: '\u5217\u8bf4\u660e',
+  outputFiles: '\u8f93\u51fa\u6587\u4ef6',
+  yes: '\u662f',
+  no: '\u5426',
+  queryComplete: '\u67e5\u8be2\u5b8c\u6210',
+  resultTotal: '\u7ed3\u679c\u603b\u6570',
+  exportedCsv: '\u5df2\u5bfc\u51fa CSV',
+  exportedDescription: '\u5df2\u5bfc\u51fa\u8bf4\u660e',
+};
+
+function printHelp() {
+  console.log(`eastmoney-select-stock - Eastmoney smart stock screener
+
+Usage:
+  eastmoney-select-stock <keyword> [options]
+  eastmoney-select-stock search <keyword> [options]
+  eastmoney-select-stock help
+
+Options:
+  --market <${MARKET_LABELS}>   Prefix the natural-language query with a market
+  --page-size <number>          Page size per request (default: 100)
+  --page-limit <number>         Safety cap for maximum page requests (default: 100)
+  --output-dir <path>           Output directory (default: eastmoney-output)
+  --prefix <name>               Output filename prefix
+  --help                        Show this help
+
+Examples:
+  eastmoney-select-stock "\u4eca\u65e5\u6da8\u5e452%\u7684\u80a1\u7968"
+  eastmoney-select-stock "\u51c0\u5229\u6da6\u589e\u957f\u7387\u5927\u4e8e20%\u7684\u534a\u5bfc\u4f53\u80a1\u7968" --market \u0041\u80a1
+  eastmoney-select-stock search "\u63a8\u8350\u7f8e\u80a1AI\u677f\u5757\u80a1\u7968" --market \u7f8e\u80a1 --prefix ai-us
+`);
+}
+
+function fail(message) {
+  console.error(`Error: ${message}`);
+  process.exit(1);
+}
+
+function escapeCsv(value) {
+  if (value === null || value === undefined) return '';
+  const text = String(value);
+  if (/[",\n]/.test(text)) {
+    return `"${text.replace(/"/g, '""')}"`;
+  }
+  return text;
+}
+
+function slugify(value) {
+  return (
+    value
+      .toLowerCase()
+      .replace(/[^a-z0-9\u4e00-\u9fff]+/g, '-')
+      .replace(/^-+|-+$/g, '')
+      .slice(0, 80) || 'eastmoney-result'
+  );
+}
+
+function formatTimestamp(date = new Date()) {
+  const pad = (n) => String(n).padStart(2, '0');
+  return [
+    date.getFullYear(),
+    pad(date.getMonth() + 1),
+    pad(date.getDate()),
+    '-',
+    pad(date.getHours()),
+    pad(date.getMinutes()),
+    pad(date.getSeconds()),
+  ].join('');
+}
+
+function buildFinalKeyword(keyword, market) {
+  if (!market) return keyword;
+  if (keyword.includes(market)) return keyword;
+  return `${market} ${keyword}`.trim();
+}
+
+function parseArgs(argv) {
+  const args = [...argv];
+  if (args[0] === 'help' || args[0] === '--help' || args[0] === '-h') {
+    return { help: true };
+  }
+  if (args[0] === 'search') {
+    args.shift();
+  }
+
+  let keyword = '';
+  const options = {
+    market: '',
+    pageSize: DEFAULT_PAGE_SIZE,
+    pageLimit: DEFAULT_PAGE_LIMIT,
+    outputDir: 'eastmoney-output',
+    prefix: '',
+  };
+
+  while (args.length > 0) {
+    const token = args.shift();
+    if (!token) continue;
+    if (token === '--help' || token === '-h') {
+      return { help: true };
+    }
+    if (token === '--market') {
+      options.market = args.shift() || '';
+      continue;
+    }
+    if (token === '--page-size') {
+      const raw = args.shift();
+      const value = Number(raw);
+      if (!Number.isFinite(value) || value <= 0) {
+        fail(`invalid --page-size value: ${raw || ''}`);
+      }
+      options.pageSize = Math.floor(value);
+      continue;
+    }
+    if (token === '--page-limit') {
+      const raw = args.shift();
+      const value = Number(raw);
+      if (!Number.isFinite(value) || value <= 0) {
+        fail(`invalid --page-limit value: ${raw || ''}`);
+      }
+      options.pageLimit = Math.floor(value);
+      continue;
+    }
+    if (token === '--output-dir') {
+      options.outputDir = args.shift() || '';
+      if (!options.outputDir) {
+        fail('missing value for --output-dir');
+      }
+      continue;
+    }
+    if (token === '--prefix') {
+      options.prefix = args.shift() || '';
+      if (!options.prefix) {
+        fail('missing value for --prefix');
+      }
+      continue;
+    }
+    if (token.startsWith('--')) {
+      fail(`unknown option: ${token}`);
+    }
+    keyword = keyword ? `${keyword} ${token}` : token;
+  }
+
+  return { help: false, keyword, options };
+}
+
+async function fetchPage(apiKey, keyword, pageNo, pageSize) {
+  const response = await fetch(API_URL, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      apikey: apiKey,
+    },
+    body: JSON.stringify({
+      keyword,
+      pageNo,
+      pageSize,
+    }),
+  });
+
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(`HTTP ${response.status}: ${text.slice(0, 300)}`);
+  }
+
+  return response.json();
+}
+
+function unwrapResult(payload) {
+  const business = payload?.data;
+  const nested = business?.data;
+  const result = nested?.result;
+  return {
+    status: payload?.status,
+    message: payload?.message,
+    code: business?.code,
+    msg: business?.msg,
+    parserText: nested?.parserText || '',
+    responseConditionList: nested?.responseConditionList || [],
+    totalCondition: nested?.totalCondition || null,
+    total: Number(result?.total || 0),
+    totalRecordCount: Number(result?.totalRecordCount || 0),
+    columns: Array.isArray(result?.columns) ? result.columns : [],
+    dataList: Array.isArray(result?.dataList) ? result.dataList : [],
+  };
+}
+
+function renderCsv(columns, rows) {
+  const headers = columns.map((column) => column.title || column.key || '');
+  const lines = [headers.map(escapeCsv).join(',')];
+  for (const row of rows) {
+    const values = columns.map((column) => escapeCsv(row[column.key]));
+    lines.push(values.join(','));
+  }
+  return lines.join('\n') + '\n';
+}
+
+function renderDescription(context) {
+  const lines = [];
+  lines.push(`# ${LABELS.title}`, '');
+  lines.push(`- ${LABELS.originalKeyword}: ${context.originalKeyword}`);
+  lines.push(`- ${LABELS.finalKeyword}: ${context.finalKeyword}`);
+  lines.push(`- ${LABELS.total}: ${context.total}`);
+  lines.push(`- ${LABELS.totalRecordCount}: ${context.totalRecordCount}`);
+  lines.push(`- ${LABELS.pagesFetched}: ${context.pagesFetched}`);
+  lines.push(`- ${LABELS.exportedAt}: ${new Date().toISOString()}`);
+  lines.push('');
+
+  if (context.parserText) {
+    lines.push(`## ${LABELS.parsedConditions}`, '', context.parserText, '');
+  }
+
+  if (context.totalCondition) {
+    lines.push(`## ${LABELS.totalCondition}`, '');
+    lines.push(
+      `- ${LABELS.conditionDescription}: ${context.totalCondition.describe || ''}`,
+    );
+    lines.push(
+      `- ${LABELS.conditionHitCount}: ${context.totalCondition.stockCount ?? ''}`,
+    );
+    lines.push('');
+  }
+
+  if (context.responseConditionList.length > 0) {
+    lines.push(
+      `## ${LABELS.singleConditions}`,
+      '',
+      `| ${LABELS.conditionDescription} | ${LABELS.conditionHitCount} |`,
+      '| --- | --- |',
+    );
+    for (const item of context.responseConditionList) {
+      lines.push(`| ${item.describe || ''} | ${item.stockCount ?? ''} |`);
+    }
+    lines.push('');
+  }
+
+  if (context.columns.length > 0) {
+    lines.push(
+      `## ${LABELS.columns}`,
+      '',
+      '| 中文列名 | 英文字段 | 数据类型 | 单位 | 数据日期 | 可排序 |',
+      '| --- | --- | --- | --- | --- | --- |',
+    );
+    for (const column of context.columns) {
+      lines.push(
+        `| ${column.title || ''} | ${column.key || ''} | ${column.dataType || ''} | ${column.unit || ''} | ${column.dateMsg || ''} | ${column.sortable ? LABELS.yes : LABELS.no} |`,
+      );
+    }
+    lines.push('');
+  }
+
+  lines.push(`## ${LABELS.outputFiles}`, '');
+  lines.push(`- CSV: ${context.csvPath}`);
+  lines.push(`- 说明: ${context.descriptionPath}`);
+  lines.push('');
+
+  return lines.join('\n');
+}
+
+async function main() {
+  const parsed = parseArgs(process.argv.slice(2));
+  if (parsed.help) {
+    printHelp();
+    return;
+  }
+
+  const { keyword, options } = parsed;
+  if (!keyword) {
+    printHelp();
+    fail('missing keyword');
+  }
+
+  const apiKey = process.env.EASTMONEY_APIKEY;
+  if (!apiKey) {
+    fail('EASTMONEY_APIKEY is not set');
+  }
+
+  const finalKeyword = buildFinalKeyword(keyword, options.market);
+  const firstPage = await fetchPage(apiKey, finalKeyword, 1, options.pageSize);
+  const first = unwrapResult(firstPage);
+
+  if (first.status !== 0) {
+    fail(
+      `api status=${first.status}, message=${first.message || 'unknown error'}`,
+    );
+  }
+  if (String(first.code) !== '100') {
+    fail(
+      `business code=${first.code || 'unknown'}, message=${first.msg || 'unknown error'}`,
+    );
+  }
+
+  if (first.dataList.length === 0 || first.total === 0) {
+    console.log(EMPTY_RESULT_MESSAGE);
+    return;
+  }
+
+  const rows = [...first.dataList];
+  const total = Math.max(first.total, first.totalRecordCount, rows.length);
+  let pagesFetched = 1;
+
+  for (
+    let pageNo = 2;
+    pageNo <= options.pageLimit && rows.length < total;
+    pageNo += 1
+  ) {
+    const pagePayload = await fetchPage(
+      apiKey,
+      finalKeyword,
+      pageNo,
+      options.pageSize,
+    );
+    const page = unwrapResult(pagePayload);
+    if (page.dataList.length === 0) {
+      break;
+    }
+    rows.push(...page.dataList);
+    pagesFetched += 1;
+  }
+
+  const outputDir = path.resolve(process.cwd(), options.outputDir);
+  fs.mkdirSync(outputDir, { recursive: true });
+
+  const prefix = options.prefix || `${slugify(finalKeyword)}-${formatTimestamp()}`;
+  const csvPath = path.join(outputDir, `${prefix}.csv`);
+  const descriptionPath = path.join(outputDir, `${prefix}.description.md`);
+
+  fs.writeFileSync(csvPath, renderCsv(first.columns, rows), 'utf8');
+  fs.writeFileSync(
+    descriptionPath,
+    renderDescription({
+      originalKeyword: keyword,
+      finalKeyword,
+      total: first.total,
+      totalRecordCount: first.totalRecordCount,
+      pagesFetched,
+      parserText: first.parserText,
+      responseConditionList: first.responseConditionList,
+      totalCondition: first.totalCondition,
+      columns: first.columns,
+      csvPath,
+      descriptionPath,
+    }),
+    'utf8',
+  );
+
+  console.log(`${LABELS.queryComplete}: ${finalKeyword}`);
+  console.log(`${LABELS.resultTotal}: ${first.total}`);
+  console.log(`${LABELS.exportedCsv}: ${csvPath}`);
+  console.log(`${LABELS.exportedDescription}: ${descriptionPath}`);
+}
+
+main().catch((error) => {
+  fail(error instanceof Error ? error.message : String(error));
+});

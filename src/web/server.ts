@@ -367,6 +367,8 @@ async function runDirectChatTurn(
   let streamedReply = '';
   let finalReply = '';
   let streamedSessionId: string | undefined;
+  let terminalStatus: ContainerOutput['status'] | null = null;
+  let terminalError = '';
 
   const output = await runContainerAgent(
     group,
@@ -397,6 +399,10 @@ async function runDirectChatTurn(
         await runOptions.onChunk?.({ kind: streamKind, value: chunk.result });
         return;
       }
+      if (chunk.done) {
+        terminalStatus = chunk.status;
+        terminalError = chunk.error || '';
+      }
       if (chunk.done && chunk.result) {
         finalReply = formatOutbound(chunk.result);
       }
@@ -416,23 +422,28 @@ async function runDirectChatTurn(
     setSession(DIRECT_GROUP_FOLDER, sessions[DIRECT_GROUP_FOLDER]);
   }
 
-  if (output.status !== 'success' && !streamedReply) {
+  const effectiveError = terminalError || output.error || '';
+  if ((terminalStatus === 'error' || output.status !== 'success') && !streamedReply && !finalReply) {
     logger.error(
-      { error: output.error, userAgent },
+      { error: effectiveError || output.error, userAgent },
       'Direct chat request failed',
     );
-    throw new Error(output.error || 'direct_chat_failed');
+    throw new Error(effectiveError || output.error || 'direct_chat_failed');
   }
 
-  const reply = formatOutbound(
-    streamedReply ||
-      finalReply ||
-      (typeof output.result === 'string'
-        ? output.result
-        : JSON.stringify(output.result ?? '')),
-  );
+  const fallbackReply =
+    typeof output.result === 'string'
+      ? output.result
+      : output.result == null
+        ? ''
+        : JSON.stringify(output.result);
+
+  const reply = formatOutbound(streamedReply || finalReply || fallbackReply);
 
   if (!reply) {
+    if (effectiveError) {
+      throw new Error(effectiveError);
+    }
     throw new Error('empty_reply');
   }
 

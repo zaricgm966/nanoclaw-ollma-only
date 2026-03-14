@@ -56,6 +56,7 @@ export interface BrowserScreenshotResult {
   ok: boolean;
   action: 'screenshot';
   path: string;
+  screenshotUrl?: string;
   url: string;
   title: string;
   domain: string;
@@ -91,7 +92,16 @@ function sleep(ms: number): Promise<void> {
 }
 
 function buildTempScreenshotPath(): string {
-  return path.join('/tmp', `nanoclaw-browser-${Date.now()}.png`);
+  return path.join('/workspace/screenshots', `browser-${Date.now()}.png`);
+}
+
+function getScreenshotUrl(targetPath: string): string | undefined {
+  const normalized = path.resolve(targetPath).replace(/\\/g, '/');
+  const screenshotsRoot = path.resolve('/workspace/screenshots').replace(/\\/g, '/');
+  if (!normalized.startsWith(screenshotsRoot + '/') && normalized !== screenshotsRoot) {
+    return undefined;
+  }
+  return `/api/screenshots/${path.basename(targetPath)}`;
 }
 
 export function getBrowserControlExecutableHints(): string[] {
@@ -555,6 +565,7 @@ export async function browserScreenshot(options?: {
       ok: true,
       action: 'screenshot',
       path: targetPath,
+      screenshotUrl: getScreenshotUrl(targetPath),
       url,
       title: normalizeWhitespace(await page.title().catch(() => '')),
       domain: getDomain(url),

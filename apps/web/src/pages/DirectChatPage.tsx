@@ -266,7 +266,7 @@ export function DirectChatPage() {
         <div>
           <p className="eyebrow">Direct Chat</p>
           <h2>直接对话</h2>
-          <p className="muted">不经过 Telegram，直接在 Web 控制台里与 NanoClaw 对话</p>
+          <p className="muted">不经过 Telegram，直接在 Web 控制台里与 NanoClaw 对话。现在也可以直接问股票筛选、板块成分股和 A 股/港股/美股推荐。</p>
         </div>
         <button
           className="ghost-button danger"
@@ -284,7 +284,7 @@ export function DirectChatPage() {
           {!hasMessages && (
             <div className="chat-empty">
               <strong>还没有对话记录</strong>
-              <p className="muted">现在就发第一条消息，NanoClaw 会直接通过本地 Ollama 回复你。</p>
+              <p className="muted">现在就发第一条消息。你也可以直接输入“今日涨幅2%的股票”或“推荐港股高股息股票”来调用东方财富选股能力。</p>
             </div>
           )}
           {messages.data?.map((item) => {
@@ -338,7 +338,7 @@ export function DirectChatPage() {
             value={message}
             onChange={(event) => setMessage(event.target.value)}
             onKeyDown={onKeyDown}
-            placeholder="直接输入你想让 NanoClaw 处理的内容，Enter 发送，Shift + Enter 换行"
+            placeholder="直接输入你想让 NanoClaw 处理的内容，例如：今日涨幅2%的股票。Enter 发送，Shift + Enter 换行"
             rows={4}
           />
           <div className="chat-composer-footer">

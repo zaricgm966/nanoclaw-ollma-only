@@ -1,0 +1,16 @@
+skill: add-eastmoney-select-stock
+version: 1.0.0
+description: "Add Eastmoney smart stock screening capability to container agents via the Eastmoney Skills API"
+core_version: 1.2.10
+adds:
+  - container/skills/eastmoney-select-stock/SKILL.md
+  - container/skills/eastmoney-select-stock/eastmoney-select-stock
+modifies:
+  - container/Dockerfile
+structured:
+  npm_dependencies: {}
+  env_additions:
+    - EASTMONEY_APIKEY
+conflicts: []
+depends: []
+test: "npx vitest run --config vitest.skills.config.ts .agents/skills/add-eastmoney-select-stock/tests/eastmoney-select-stock.test.ts"

@@ -3,6 +3,7 @@
  * Runs inside a container, receives config via stdin, and answers via Ollama.
  */
 
+import { execFile } from 'child_process';
 import { randomUUID } from 'crypto';
 import fs from 'fs';
 import path from 'path';
@@ -57,31 +58,39 @@ interface ConversationMessage {
   content: string;
 }
 
+type SupportedTool =
+  | 'eastmoney_select_stock'
+  | 'web_search'
+  | 'web_fetch'
+  | 'open_app'
+  | 'take_screenshot'
+  | 'apply_skill'
+  | 'browser_navigate'
+  | 'browser_snapshot'
+  | 'browser_click'
+  | 'browser_type'
+  | 'browser_scroll'
+  | 'browser_back'
+  | 'browser_forward'
+  | 'browser_reload'
+  | 'browser_read'
+  | 'browser_screenshot'
+  | 'browser_links'
+  | 'browser_press'
+  | 'browser_select'
+  | 'browser_hover'
+  | 'browser_wait_for_text';
+
 interface ToolCall {
-  tool:
-    | 'web_search'
-    | 'web_fetch'
-    | 'open_app'
-    | 'take_screenshot'
-    | 'browser_navigate'
-    | 'browser_snapshot'
-    | 'browser_click'
-    | 'browser_type'
-    | 'browser_scroll'
-    | 'browser_back'
-    | 'browser_forward'
-    | 'browser_reload'
-    | 'browser_read'
-    | 'browser_screenshot'
-    | 'browser_links'
-    | 'browser_press'
-    | 'browser_select'
-    | 'browser_hover'
-    | 'browser_wait_for_text';
+  tool: SupportedTool;
   input: {
+    keyword?: string;
+    market?: string;
     query?: string;
     url?: string;
     app?: string;
+    skill?: string;
+    skillPath?: string;
     elementId?: string;
     text?: string;
     direction?: 'up' | 'down';
@@ -108,6 +117,32 @@ interface ExecutedHostToolResult {
   raw: HostToolResult;
 }
 
+type ScreenshotTarget = 'desktop' | 'browser-page' | 'unknown';
+type DecisionSource = 'model' | 'override' | 'fallback';
+
+type FirstActionDecision =
+  | {
+      kind: 'direct-answer';
+      reason: string;
+    }
+  | {
+      kind: 'tool';
+      toolCall: ToolCall;
+      reason: string;
+      source: DecisionSource;
+    };
+
+interface IntentProfile {
+  latestUserText: string;
+  eastmoneyScore: number;
+  screenshotTarget: ScreenshotTarget;
+  browserWorkflowScore: number;
+  browserSearchScore: number;
+  internetScore: number;
+  openAppScore: number;
+  hasExplicitUrl: boolean;
+}
+
 const OUTPUT_START_MARKER = '---NANOCLAW_OUTPUT_START---';
 const OUTPUT_END_MARKER = '---NANOCLAW_OUTPUT_END---';
 const IPC_INPUT_DIR = '/workspace/ipc/input';
@@ -122,12 +157,19 @@ const DEFAULT_OLLAMA_HOSTS = [
   'http://172.17.0.1:11434',
   'http://localhost:11434',
 ];
-const MAX_TOOL_STEPS = 4;
-const SUPPORTED_TOOLS: ToolCall['tool'][] = [
+const DEFAULT_MAX_TOOL_STEPS = 4;
+const BROWSER_WORKFLOW_MAX_TOOL_STEPS = 7;
+const MAX_REPEATED_TOOL_CALLS = 2;
+const TOOL_RESULT_MARKER = '[TOOL RESULT - NOT A USER MESSAGE]';
+const TOOL_RESULT_CONTINUATION_HINT =
+  'Continue from this runtime update. The user request has not changed.';
+const SUPPORTED_TOOLS: SupportedTool[] = [
+  'eastmoney_select_stock',
   'web_search',
   'web_fetch',
   'open_app',
   'take_screenshot',
+  'apply_skill',
   'browser_navigate',
   'browser_snapshot',
   'browser_click',
@@ -144,14 +186,287 @@ const SUPPORTED_TOOLS: ToolCall['tool'][] = [
   'browser_hover',
   'browser_wait_for_text',
 ];
-const INTERNET_REQUEST_PATTERN =
-  /\b(search|latest|today|current|news|official|website|site|web|internet|online|github|docs|documentation|release|version|price|prices|lookup|look up|find)\b|\u4ef7\u683c|\u5b98\u7f51|\u65b0\u95fb|\u6700\u65b0|\u641c\u7d22|\u67e5\u4e00\u4e0b|\u641c\u4e00\u4e0b|\u8054\u7f51/i;
-const SCREENSHOT_REQUEST_PATTERN =
-  /(screenshot|screen shot|capture screen|take a screenshot|\u622a\u5c4f|\u622a\u56fe|\u5c4f\u5e55\u622a\u56fe|\u684c\u9762\u622a\u56fe)/i;
-const OPEN_APP_REQUEST_PATTERN =
-  /(open app|launch app|start app|open software|run app|run program|open\s+(notepad|steam|chrome|edge|calculator|calc|paint|explorer|terminal|cmd|powershell)|launch\s+(notepad|steam|chrome|edge|calculator|calc|paint|explorer|terminal|cmd|powershell)|start\s+(notepad|steam|chrome|edge|calculator|calc|paint|explorer|terminal|cmd|powershell)|\u6253\u5f00\s*(steam|Steam|\u8bb0\u4e8b\u672c|\u6d4f\u89c8\u5668|\u8ba1\u7b97\u5668|\u7ec8\u7aef|cmd|powershell)|\u542f\u52a8\s*(steam|Steam|\u8bb0\u4e8b\u672c|\u6d4f\u89c8\u5668|\u8ba1\u7b97\u5668|\u7ec8\u7aef|cmd|powershell)|\u8fd0\u884c\s*(steam|Steam|\u8bb0\u4e8b\u672c|\u6d4f\u89c8\u5668|\u8ba1\u7b97\u5668|\u7ec8\u7aef|cmd|powershell))/i;
+const BROWSER_TOOL_SET = new Set<SupportedTool>([
+  'browser_navigate',
+  'browser_snapshot',
+  'browser_click',
+  'browser_type',
+  'browser_scroll',
+  'browser_back',
+  'browser_forward',
+  'browser_reload',
+  'browser_read',
+  'browser_screenshot',
+  'browser_links',
+  'browser_press',
+  'browser_select',
+  'browser_hover',
+  'browser_wait_for_text',
+]);
+const HOST_TOOL_SET = new Set<SupportedTool>(['open_app', 'take_screenshot', 'apply_skill']);
+const INTERNET_TOOL_SET = new Set<SupportedTool>(['web_search', 'web_fetch']);
+const EASTMONEY_MARKET_SIGNALS = ['a股', 'A股', '港股', '美股'];
+const EASTMONEY_STRONG_SIGNALS = [
+  '东方财富',
+  '东财',
+  '选股',
+  '筛股',
+  '股票推荐',
+  '板块推荐',
+  '行业股票',
+  '成分股',
+  '财务指标',
+  '行情指标',
+  '市盈率',
+  '市净率',
+  '净利润',
+  'roe',
+  'pe',
+  'pb',
+];
+const EASTMONEY_WEAK_SIGNALS = [
+  '股票',
+  '板块',
+  '行业',
+  '指数',
+  '涨幅',
+  '跌幅',
+  '推荐',
+];
+const ELEMENT_TARGETED_BROWSER_TOOLS = new Set<SupportedTool>([
+  'browser_click',
+  'browser_type',
+  'browser_select',
+  'browser_hover',
+]);
 const STALE_LIMITATION_PATTERN =
   /without Claude Code, external APIs, or remote tools|cannot access real[- ]?time network|do not have web search|cannot browse the web|as of 2024|repeat my final answer|repeat the final answer|previous answer to repeat|there's no previous conversation|there is no previous conversation|The user is asking me to repeat/i;
+const DESKTOP_SCREENSHOT_SIGNALS = [
+  'desktop screenshot',
+  'screen shot',
+  'screenshot the screen',
+  'whole screen',
+  'entire screen',
+  'current screen',
+  'capture screen',
+  'desktop',
+  '桌面',
+  '屏幕',
+  '整个屏幕',
+  '当前屏幕',
+  '桌面截图',
+  '屏幕截图',
+];
+const BROWSER_SCREENSHOT_SIGNALS = [
+  'browser screenshot',
+  'page screenshot',
+  'website screenshot',
+  'webpage screenshot',
+  'screenshot this page',
+  'screenshot the page',
+  'screenshot the website',
+  'browser page',
+  'web page',
+  'website page',
+  '网页截图',
+  '页面截图',
+  '截取网页',
+  '截取页面',
+  '浏览器截图',
+  '网站截图',
+  '网页',
+  '网站',
+  '浏览器',
+  '页面',
+];
+const BROWSER_STRONG_SIGNALS = [
+  'browser_',
+  'open browser',
+  'use browser',
+  'in the browser',
+  'navigate to',
+  'go to',
+  'visit',
+  'open website',
+  'open webpage',
+  'web page',
+  'website',
+  'page',
+  'tab',
+  'url',
+  'link',
+  '打开浏览器',
+  '用浏览器',
+  '在浏览器',
+  '打开网页',
+  '打开网站',
+  '访问网页',
+  '访问网站',
+  '链接',
+  '网址',
+  '网页',
+  '网站',
+  '页面',
+  '浏览器',
+];
+const BROWSER_ACTION_SIGNALS = [
+  'click',
+  'type',
+  'input',
+  'scroll',
+  'hover',
+  'reload',
+  'back',
+  'forward',
+  'select',
+  'press',
+  '点击',
+  '输入',
+  '滚动',
+  '刷新',
+  '回退',
+  '前进',
+  '选择',
+];
+const BROWSER_SEARCH_SIGNALS = [
+  'search',
+  'find',
+  'look up',
+  'lookup',
+  'query',
+  'google',
+  'bing',
+  'duckduckgo',
+  '搜索',
+  '查找',
+  '查询',
+  '查一下',
+  '搜一下',
+];
+const INTERNET_STRONG_SIGNALS = [
+  'latest',
+  'today',
+  'current',
+  'news',
+  'official',
+  'website',
+  'github',
+  'docs',
+  'documentation',
+  'release',
+  'version',
+  'price',
+  'prices',
+  '最新',
+  '新闻',
+  '官网',
+  '文档',
+  '版本',
+  '价格',
+];
+const INTERNET_WEAK_SIGNALS = [
+  'search',
+  'find',
+  'look up',
+  'lookup',
+  'web',
+  'internet',
+  'online',
+  '联网',
+  '搜索',
+  '查一下',
+  '搜一下',
+];
+const SKILL_INSTALL_SIGNALS = [
+  'install skill',
+  'apply skill',
+  'add skill',
+  '??skill',
+  '????',
+  '??skill',
+  '????',
+  '????skill',
+  '??????',
+  '????',
+];
+
+const OPEN_APP_STRONG_SIGNALS = [
+  'open app',
+  'launch app',
+  'start app',
+  'open software',
+  'run program',
+  'notepad',
+  'steam',
+  'calculator',
+  'powershell',
+  'cmd',
+  'terminal',
+  'explorer',
+  'paint',
+  '打开',
+  '启动',
+  '运行',
+  '记事本',
+  '计算器',
+  '终端',
+  '命令提示符',
+];
+const COMMON_FILLER_PHRASES = [
+  'please',
+  'could you',
+  'can you',
+  'would you',
+  'for me',
+  'help me',
+  'i want you to',
+  '请',
+  '帮我',
+  '帮我把',
+  '麻烦你',
+  '谢谢',
+  '我想让你',
+];
+const SEARCH_ACTION_PHRASES = [
+  'search',
+  'find',
+  'look up',
+  'lookup',
+  'query',
+  'open browser',
+  'use browser',
+  'in the browser',
+  'browser',
+  '打开浏览器',
+  '在浏览器',
+  '用浏览器',
+  '搜索',
+  '查询',
+  '查找',
+  '查一下',
+  '搜一下',
+];
+const SCREENSHOT_CONTEXT_PHRASES = [
+  'screenshot',
+  'screen shot',
+  'capture',
+  'page screenshot',
+  'browser screenshot',
+  '截图',
+  '截屏',
+  '网页截图',
+  '页面截图',
+  '截取网页',
+];
+const OUTPUT_FORMAT_FILLERS = [
+  'just reply with',
+  'only reply with',
+  'only return',
+  '只回复',
+  '只返回',
+  '告诉我',
+  '给我',
+];
 
 function log(message: string): void {
   console.error(`[ollama-runner] ${message}`);
@@ -235,9 +550,8 @@ function loadHistory(sessionId: string): ConversationMessage[] {
 }
 
 function trimHistory(messages: ConversationMessage[]): ConversationMessage[] {
-  const systemMessages = messages.filter((message) => message.role === 'system');
   const conversational = messages.filter((message) => message.role !== 'system');
-  return [...systemMessages, ...conversational.slice(-24)];
+  return conversational.slice(-24);
 }
 
 function saveHistory(sessionId: string, messages: ConversationMessage[]): void {
@@ -245,6 +559,19 @@ function saveHistory(sessionId: string, messages: ConversationMessage[]): void {
     getSessionPath(sessionId),
     JSON.stringify({ messages: trimHistory(messages) }, null, 2),
   );
+}
+
+function persistConversationTurn(
+  sessionId: string,
+  history: ConversationMessage[],
+  prompt: string,
+  reply: string,
+): void {
+  saveHistory(sessionId, [
+    ...history,
+    { role: 'user', content: prompt },
+    { role: 'assistant', content: reply },
+  ]);
 }
 
 function readOptionalFile(filePath: string): string {
@@ -255,13 +582,6 @@ function readOptionalFile(filePath: string): string {
   }
 }
 
-function sanitizeHistory(messages: ConversationMessage[]): ConversationMessage[] {
-  return messages.filter((message) => {
-    if (message.role !== 'assistant') return true;
-    return !STALE_LIMITATION_PATTERN.test(message.content);
-  });
-}
-
 function buildSystemPrompt(input: ContainerInput): string {
   const parts: string[] = [];
   const assistantName = input.assistantName || 'NanoClaw';
@@ -269,21 +589,22 @@ function buildSystemPrompt(input: ContainerInput): string {
   parts.push(
     `You are ${assistantName}, a local NanoClaw assistant powered only by Ollama.`,
     'You are running without Claude Code or Anthropic services.',
-    'You may use built-in tools when they help: web_search, web_fetch, open_app, take_screenshot, browser_navigate, browser_snapshot, browser_click, browser_type, browser_scroll, browser_back, browser_forward, browser_reload, browser_read, browser_screenshot, browser_links, browser_press, browser_select, browser_hover, and browser_wait_for_text.',
+    'You may use built-in tools when they help: eastmoney_select_stock, web_search, web_fetch, open_app, take_screenshot, apply_skill, browser_navigate, browser_snapshot, browser_click, browser_type, browser_scroll, browser_back, browser_forward, browser_reload, browser_read, browser_screenshot, browser_links, browser_press, browser_select, browser_hover, and browser_wait_for_text.',
+    'eastmoney_select_stock runs a local Eastmoney stock screening CLI for fresh A股, 港股, and 美股 screening, sector lookup, constituent lookup, and recommendation workflows.',
     'web_search uses a real browser to search the web. web_fetch uses a real browser to open a page and extract readable content.',
     'The browser_* tools control a persistent browser page for multi-step workflows. Start with browser_navigate to open a URL, use browser_snapshot to inspect the current page and get element IDs, then use browser_click, browser_type, browser_select, browser_hover, browser_scroll, browser_press, browser_back, browser_forward, browser_reload, browser_read, browser_links, browser_screenshot, and browser_wait_for_text as needed.',
-    'open_app asks the host OS to open a desktop application by name or path. take_screenshot asks the host OS to capture the current desktop and returns the saved file path.',
+    'open_app asks the host OS to open a desktop application by name or path. take_screenshot asks the host OS to capture the current desktop and returns the saved file path. apply_skill asks the host to install a packaged local NanoClaw skill from .agents/skills using the skills engine.',
     'If you want to use a tool, reply with ONLY compact JSON and no markdown fences.',
-    'Tool call examples: {"tool":"web_search","input":{"query":"latest NanoClaw GitHub repo"}}, {"tool":"browser_navigate","input":{"url":"https://example.com"}}, {"tool":"browser_click","input":{"elementId":"el-2"}}, {"tool":"browser_type","input":{"elementId":"el-3","text":"hello","clear":true}}, or {"tool":"open_app","input":{"app":"Notepad"}}.',
+    'Tool call examples: {"tool":"eastmoney_select_stock","input":{"keyword":"今日涨幅2%的股票","market":"A股"}}, {"tool":"web_search","input":{"query":"latest NanoClaw GitHub repo"}}, {"tool":"browser_navigate","input":{"url":"https://example.com"}}, {"tool":"browser_click","input":{"elementId":"el-2"}}, {"tool":"browser_type","input":{"elementId":"el-3","text":"hello","clear":true}}, {"tool":"open_app","input":{"app":"Notepad"}}, or {"tool":"apply_skill","input":{"skill":"add-telegram"}}.',
     'Only call one tool at a time. After you receive tool output, continue reasoning and either call another tool or provide the final answer normally.',
     'If you already have enough information, answer normally and do not emit JSON.',
     'If the user asks for fresh facts, search results, prices, release info, docs, websites, GitHub links, news, or anything likely to change, prefer using the internet tools instead of answering from stale memory.',
-    'Infer the reply language from the latest user prompt. If the latest user prompt is in Chinese, answer in Simplified Chinese even when search results or fetched pages are in English.',
+    "If the latest user prompt is in Chinese, answer in Chinese and try to match the user's script style (Simplified or Traditional) instead of forcing Simplified Chinese.",
     'When you answer using internet tool results, give a short direct answer first, then add a compact Sources section listing the source title and URL you relied on.',
     'If the user explicitly asks to only return a URL, name, version, or another minimal format, follow that output format and omit extra prose.',
     'Be honest about limitations. Do not claim to have executed commands or modified files unless the host explicitly did so outside this model.',
     'Reply in the same language as the user when practical, and keep answers useful and direct.',
-    'If the prompt includes <client channel="web" ...>, markdown is allowed. When take_screenshot returns SCREENSHOT_URL, you may include a markdown image using that URL if the user asked to see the screenshot.',
+    'If the prompt includes <client channel="web" ...>, markdown is allowed. When take_screenshot or browser_screenshot returns a screenshotUrl or SCREENSHOT_URL, you may include a markdown image using that URL if the user asked to see the screenshot.',
   );
 
   const envPrompt = (process.env.OLLAMA_SYSTEM_PROMPT || '').trim();
@@ -303,19 +624,6 @@ function buildSystemPrompt(input: ContainerInput): string {
 
   return parts.join('\n');
 }
-
-function isLikelyInternetRequest(prompt: string): boolean {
-  return INTERNET_REQUEST_PATTERN.test(extractLatestUserText(prompt));
-}
-
-function isLikelyScreenshotRequest(prompt: string): boolean {
-  return SCREENSHOT_REQUEST_PATTERN.test(extractLatestUserText(prompt));
-}
-
-function isLikelyOpenAppRequest(prompt: string): boolean {
-  return OPEN_APP_REQUEST_PATTERN.test(extractLatestUserText(prompt));
-}
-
 function decodeXmlEntities(value: string): string {
   return value
     .replace(/&quot;/g, '"')
@@ -333,37 +641,360 @@ function extractLatestUserText(prompt: string): string {
     .trim();
 }
 
+function normalizeIntentText(text: string): string {
+  return text.toLowerCase().replace(/\s+/g, ' ').trim();
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function hasAnySignal(text: string, phrases: string[]): boolean {
+  return phrases.some((phrase) => text.includes(phrase));
+}
+
+function scoreSignals(text: string, strong: string[], medium: string[] = [], weak: string[] = []): number {
+  let score = 0;
+  for (const phrase of strong) {
+    if (text.includes(phrase)) score += 3;
+  }
+  for (const phrase of medium) {
+    if (text.includes(phrase)) score += 2;
+  }
+  for (const phrase of weak) {
+    if (text.includes(phrase)) score += 1;
+  }
+  return score;
+}
+
+function hasExplicitUrl(text: string): boolean {
+  return /https?:\/\/\S+/i.test(text);
+}
+
+function extractExplicitUrl(text: string): string | null {
+  const match = text.match(/https?:\/\/\S+/i);
+  if (!match) return null;
+  return match[0].replace(/[),.;]+$/, '');
+}
+
+function detectScreenshotTarget(text: string): ScreenshotTarget {
+  const normalized = normalizeIntentText(text);
+  const mentionsScreenshot =
+    normalized.includes('screenshot') ||
+    normalized.includes('screen shot') ||
+    normalized.includes('截图') ||
+    normalized.includes('截屏');
+
+  if (!mentionsScreenshot) {
+    return 'unknown';
+  }
+
+  const browserScore = scoreSignals(normalized, BROWSER_SCREENSHOT_SIGNALS, BROWSER_STRONG_SIGNALS);
+  const desktopScore = scoreSignals(normalized, DESKTOP_SCREENSHOT_SIGNALS);
+
+  if (browserScore > desktopScore) return 'browser-page';
+  if (desktopScore > browserScore) return 'desktop';
+  if (hasAnySignal(normalized, BROWSER_STRONG_SIGNALS)) return 'browser-page';
+  if (hasAnySignal(normalized, DESKTOP_SCREENSHOT_SIGNALS)) return 'desktop';
+  return 'unknown';
+}
+
+function scoreBrowserWorkflowIntent(text: string): number {
+  const normalized = normalizeIntentText(text);
+  let score = scoreSignals(normalized, BROWSER_STRONG_SIGNALS, BROWSER_ACTION_SIGNALS, BROWSER_SEARCH_SIGNALS);
+  if (hasExplicitUrl(normalized)) score += 3;
+  if (detectScreenshotTarget(normalized) === 'browser-page') score += 3;
+  return score;
+}
+
+function scoreBrowserSearchIntent(text: string): number {
+  const normalized = normalizeIntentText(text);
+  let score = scoreSignals(normalized, BROWSER_SEARCH_SIGNALS);
+  if (normalized.includes('地址') || normalized.includes('address')) score += 2;
+  if (normalized.includes('网址') || normalized.includes('url')) score += 2;
+  if (normalized.includes('链接') || normalized.includes('link')) score += 2;
+  return score;
+}
+
+function scoreInternetIntent(text: string): number {
+  const normalized = normalizeIntentText(text);
+  let score = scoreSignals(normalized, INTERNET_STRONG_SIGNALS, [], INTERNET_WEAK_SIGNALS);
+  if (hasExplicitUrl(normalized)) score += 2;
+  return score;
+}
+
+function scoreOpenAppIntent(text: string): number {
+  const normalized = normalizeIntentText(text);
+  let score = scoreSignals(normalized, OPEN_APP_STRONG_SIGNALS);
+  if (normalized.includes('open ') || normalized.includes('launch ')) score += 1;
+  return score;
+}
+
+function scoreEastmoneyIntent(text: string): number {
+  const normalized = normalizeIntentText(text);
+  let score = scoreSignals(
+    normalized,
+    EASTMONEY_STRONG_SIGNALS,
+    EASTMONEY_MARKET_SIGNALS,
+    EASTMONEY_WEAK_SIGNALS,
+  );
+  if (normalized.includes('今日') && normalized.includes('股票')) score += 2;
+  if (normalized.includes('条件') && normalized.includes('股票')) score += 2;
+  return score;
+}
+
+function buildIntentProfile(prompt: string): IntentProfile {
+  const latestUserText = extractLatestUserText(prompt);
+  return {
+    latestUserText,
+    eastmoneyScore: scoreEastmoneyIntent(latestUserText),
+    screenshotTarget: detectScreenshotTarget(latestUserText),
+    browserWorkflowScore: scoreBrowserWorkflowIntent(latestUserText),
+    browserSearchScore: scoreBrowserSearchIntent(latestUserText),
+    internetScore: scoreInternetIntent(latestUserText),
+    openAppScore: scoreOpenAppIntent(latestUserText),
+    hasExplicitUrl: hasExplicitUrl(latestUserText),
+  };
+}
+
+function isLikelyBrowserWorkflowRequest(prompt: string): boolean {
+  const profile = buildIntentProfile(prompt);
+  return (
+    profile.browserWorkflowScore >= 4 ||
+    profile.screenshotTarget === 'browser-page' ||
+    profile.hasExplicitUrl
+  );
+}
+
+function isLikelyBrowserSearchRequest(prompt: string): boolean {
+  const profile = buildIntentProfile(prompt);
+  return isLikelyBrowserWorkflowRequest(prompt) && profile.browserSearchScore >= 2;
+}
+
+function cleanSearchQuery(text: string, extraPhrases: string[] = []): string {
+  let cleaned = normalizeWhitespace(text);
+  const phrases = [
+    ...COMMON_FILLER_PHRASES,
+    ...SEARCH_ACTION_PHRASES,
+    ...SCREENSHOT_CONTEXT_PHRASES,
+    ...OUTPUT_FORMAT_FILLERS,
+    ...extraPhrases,
+  ].sort((a, b) => b.length - a.length);
+
+  for (const phrase of phrases) {
+    cleaned = cleaned.replace(new RegExp(escapeRegExp(phrase), 'gi'), ' ');
+  }
+
+  cleaned = cleaned
+    .replace(/[<>{}\[\]()`"'“”‘’]+/g, ' ')
+    .replace(/[,:;!?，。！？、]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  return cleaned;
+}
+
 function buildAutomaticSearchQuery(prompt: string): string {
-  return extractLatestUserText(prompt).slice(0, 240);
+  const latest = extractLatestUserText(prompt);
+  const query = cleanSearchQuery(latest, ['browser screenshot', 'page screenshot', '网页截图', '页面截图']);
+  return (query || latest).slice(0, 160);
+}
+
+function buildAutomaticBrowserSearchQuery(prompt: string): string {
+  const latest = extractLatestUserText(prompt);
+  const query = cleanSearchQuery(latest, ['browser', 'web page', 'website', 'page', 'tab', '网页', '网站', '页面', '浏览器']);
+  return (query || latest).slice(0, 120);
+}
+
+function buildAutomaticBrowserSearchUrl(prompt: string): string {
+  const query = buildAutomaticBrowserSearchQuery(prompt);
+  return `https://www.bing.com/search?q=${encodeURIComponent(query)}`;
+}
+
+function isLikelySkillInstallRequest(prompt: string): boolean {
+  const latest = normalizeIntentText(extractLatestUserText(prompt));
+  const hasInstallVerb =
+    SKILL_INSTALL_SIGNALS.some((signal) => latest.includes(signal)) ||
+    latest.includes('install') ||
+    latest.includes('apply') ||
+    latest.includes('add ') ||
+    latest.includes('\u5b89\u88c5') ||
+    latest.includes('\u5e94\u7528') ||
+    latest.includes('\u6dfb\u52a0');
+  const mentionsSkill = latest.includes('skill') || latest.includes('\u6280\u80fd');
+  return hasInstallVerb && mentionsSkill;
+}
+
+function buildAutomaticSkillName(prompt: string): string {
+  const latest = extractLatestUserText(prompt);
+  const codeLikeMatch = latest.match(/[A-Za-z][A-Za-z0-9_-]{2,}/g) || [];
+  const filtered = codeLikeMatch.filter((token) => {
+    const lowered = token.toLowerCase();
+    return !['install', 'apply', 'add', 'skill', 'skills', 'this'].includes(lowered);
+  });
+  if (filtered.length > 0) {
+    return filtered[0] || latest.slice(0, 120);
+  }
+  if (codeLikeMatch.length > 0) {
+    return codeLikeMatch[0] || latest.slice(0, 120);
+  }
+  return latest.slice(0, 120);
 }
 
 function buildAutomaticOpenAppName(prompt: string): string {
   const latest = extractLatestUserText(prompt);
-  if (/steam|\u84b8\u6c7d\u5e73\u53f0/i.test(latest)) return 'Steam';
-  if (/notepad|\u8bb0\u4e8b\u672c/i.test(latest)) return 'notepad.exe';
-  if (/browser|chrome|edge|\u6d4f\u89c8\u5668/i.test(latest)) return 'msedge.exe';
-  if (/calculator|calc|\u8ba1\u7b97\u5668/i.test(latest)) return 'calc.exe';
+  if (/steam|蒸汽平台/i.test(latest)) return 'Steam';
+  if (/notepad|记事本/i.test(latest)) return 'notepad.exe';
+  if (/browser|chrome|edge|浏览器/i.test(latest)) return 'msedge.exe';
+  if (/calculator|calc|计算器/i.test(latest)) return 'calc.exe';
   if (/powershell/i.test(latest)) return 'powershell.exe';
-  if (/cmd|command prompt|\u547d\u4ee4\u63d0\u793a\u7b26/i.test(latest)) return 'cmd.exe';
+  if (/cmd|command prompt|命令提示符/i.test(latest)) return 'cmd.exe';
   return latest.slice(0, 120);
 }
 
-function normalizeFirstToolCall(prompt: string, toolCall: ToolCall): ToolCall {
-  if (isLikelyOpenAppRequest(prompt) && toolCall.tool !== 'open_app') {
-    return {
-      tool: 'open_app',
-      input: { app: buildAutomaticOpenAppName(prompt) },
-    };
+function buildPreferredBrowserToolCall(prompt: string): ToolCall {
+  const latest = extractLatestUserText(prompt);
+  const explicitUrl = extractExplicitUrl(latest);
+  if (explicitUrl) {
+    return { tool: 'browser_navigate', input: { url: explicitUrl } };
+  }
+  if (isLikelyBrowserSearchRequest(prompt)) {
+    return { tool: 'browser_navigate', input: { url: buildAutomaticBrowserSearchUrl(prompt) } };
+  }
+  if (detectScreenshotTarget(latest) === 'browser-page') {
+    return { tool: 'browser_screenshot', input: {} };
+  }
+  return { tool: 'browser_snapshot', input: {} };
+}
+
+function buildPreferredInternetToolCall(prompt: string): ToolCall {
+  const latest = extractLatestUserText(prompt);
+  const explicitUrl = extractExplicitUrl(latest);
+  if (explicitUrl) {
+    return { tool: 'web_fetch', input: { url: explicitUrl } };
+  }
+  return { tool: 'web_search', input: { query: buildAutomaticSearchQuery(prompt) } };
+}
+
+function detectEastmoneyMarket(prompt: string): string {
+  const latest = extractLatestUserText(prompt);
+  if (latest.includes('港股')) return '港股';
+  if (latest.includes('美股')) return '美股';
+  if (latest.includes('A股') || latest.includes('a股')) return 'A股';
+  return '';
+}
+
+function buildPreferredEastmoneyToolCall(prompt: string): ToolCall {
+  return {
+    tool: 'eastmoney_select_stock',
+    input: {
+      keyword: extractLatestUserText(prompt),
+      market: detectEastmoneyMarket(prompt),
+    },
+  };
+}
+
+function isBrowserTool(tool: SupportedTool): boolean {
+  return BROWSER_TOOL_SET.has(tool);
+}
+
+function isHostTool(tool: SupportedTool): boolean {
+  return HOST_TOOL_SET.has(tool);
+}
+
+function isInternetTool(tool: SupportedTool): boolean {
+  return INTERNET_TOOL_SET.has(tool);
+}
+
+function decideFirstAction(prompt: string, modelToolCall: ToolCall | null): FirstActionDecision {
+  const profile = buildIntentProfile(prompt);
+  const wantsBrowserWorkflow = profile.browserWorkflowScore >= 4 || profile.screenshotTarget === 'browser-page' || profile.hasExplicitUrl;
+  const wantsBrowserSearch = wantsBrowserWorkflow && profile.browserSearchScore >= 2;
+  const wantsDesktopScreenshot = profile.screenshotTarget === 'desktop' && !wantsBrowserWorkflow;
+  const wantsInstallSkill = isLikelySkillInstallRequest(prompt);
+  const wantsEastmoney = profile.eastmoneyScore >= 4 && !wantsInstallSkill;
+  const wantsOpenApp = profile.openAppScore >= 4 && profile.browserWorkflowScore < profile.openAppScore;
+  const wantsInternet = profile.internetScore >= 3 && !wantsBrowserWorkflow && !wantsInstallSkill && !wantsEastmoney;
+
+  if (modelToolCall) {
+    if (wantsEastmoney) {
+      if (modelToolCall.tool === 'eastmoney_select_stock') {
+        return { kind: 'tool', toolCall: modelToolCall, reason: 'eastmoney-model-choice', source: 'model' };
+      }
+      return { kind: 'tool', toolCall: buildPreferredEastmoneyToolCall(prompt), reason: 'forced-eastmoney-tool', source: 'override' };
+    }
+    if (wantsBrowserWorkflow) {
+      if (isBrowserTool(modelToolCall.tool)) {
+        return { kind: 'tool', toolCall: modelToolCall, reason: 'browser-workflow-model-choice', source: 'model' };
+      }
+      return { kind: 'tool', toolCall: buildPreferredBrowserToolCall(prompt), reason: 'forced-browser-workflow', source: 'override' };
+    }
+    if (wantsDesktopScreenshot) {
+      if (modelToolCall.tool === 'take_screenshot') {
+        return { kind: 'tool', toolCall: modelToolCall, reason: 'desktop-screenshot-model-choice', source: 'model' };
+      }
+      return { kind: 'tool', toolCall: { tool: 'take_screenshot', input: {} }, reason: 'forced-desktop-screenshot', source: 'override' };
+    }
+    if (wantsInstallSkill) {
+      if (modelToolCall.tool === 'apply_skill') {
+        return { kind: 'tool', toolCall: modelToolCall, reason: 'install-skill-model-choice', source: 'model' };
+      }
+      return { kind: 'tool', toolCall: { tool: 'apply_skill', input: { skill: buildAutomaticSkillName(prompt) } }, reason: 'forced-install-skill', source: 'override' };
+    }
+    if (wantsOpenApp) {
+      if (modelToolCall.tool === 'open_app') {
+        return { kind: 'tool', toolCall: modelToolCall, reason: 'open-app-model-choice', source: 'model' };
+      }
+      return { kind: 'tool', toolCall: { tool: 'open_app', input: { app: buildAutomaticOpenAppName(prompt) } }, reason: 'forced-open-app', source: 'override' };
+    }
+    if (wantsInternet) {
+      if (isInternetTool(modelToolCall.tool) || isBrowserTool(modelToolCall.tool)) {
+        return { kind: 'tool', toolCall: modelToolCall, reason: 'internet-model-choice', source: 'model' };
+      }
+      return { kind: 'tool', toolCall: buildPreferredInternetToolCall(prompt), reason: 'forced-internet-tool', source: 'override' };
+    }
+    return { kind: 'tool', toolCall: modelToolCall, reason: 'model-choice', source: 'model' };
   }
 
-  if (isLikelyScreenshotRequest(prompt) && toolCall.tool !== 'take_screenshot') {
-    return {
-      tool: 'take_screenshot',
-      input: {},
-    };
+  if (wantsBrowserWorkflow) {
+    return { kind: 'tool', toolCall: buildPreferredBrowserToolCall(prompt), reason: wantsBrowserSearch ? 'browser-workflow-fallback' : 'browser-workflow-fallback', source: 'fallback' };
   }
+  if (wantsDesktopScreenshot) {
+    return { kind: 'tool', toolCall: { tool: 'take_screenshot', input: {} }, reason: 'desktop-screenshot-fallback', source: 'fallback' };
+  }
+  if (wantsInstallSkill) {
+    return { kind: 'tool', toolCall: { tool: 'apply_skill', input: { skill: buildAutomaticSkillName(prompt) } }, reason: 'install-skill-fallback', source: 'fallback' };
+  }
+  if (wantsEastmoney) {
+    return { kind: 'tool', toolCall: buildPreferredEastmoneyToolCall(prompt), reason: 'eastmoney-fallback', source: 'fallback' };
+  }
+  if (wantsOpenApp) {
+    return { kind: 'tool', toolCall: { tool: 'open_app', input: { app: buildAutomaticOpenAppName(prompt) } }, reason: 'open-app-fallback', source: 'fallback' };
+  }
+  if (wantsInternet) {
+    return { kind: 'tool', toolCall: buildPreferredInternetToolCall(prompt), reason: 'internet-fallback', source: 'fallback' };
+  }
+  return { kind: 'direct-answer', reason: 'no-first-tool-needed' };
+}
 
-  return toolCall;
+function buildRuntimeHintMessages(prompt: string): ConversationMessage[] {
+  const profile = buildIntentProfile(prompt);
+  if (isLikelySkillInstallRequest(prompt)) {
+    return [{ role: 'system', content: 'The latest user request is about installing a NanoClaw skill. Use apply_skill with the local packaged skill name when possible. If the requested skill is not a packaged local skill, explain that manifest.yaml and SKILL.md are required.' }];
+  }
+  if (profile.eastmoneyScore >= 4) {
+    return [{ role: 'system', content: 'The latest user request is about stock screening or stock recommendations. Prefer the eastmoney_select_stock tool because it uses fresh Eastmoney data. Pass the latest user request as the keyword. If the user mentions A股, 港股, or 美股, include that market. After the tool returns, summarize the results in Chinese and mention the exported CSV and description file paths.' }];
+  }
+  if (profile.browserWorkflowScore >= 4 || profile.screenshotTarget === 'browser-page' || profile.hasExplicitUrl) {
+    return [{ role: 'system', content: 'The latest user request is a browser workflow. Prefer browser_navigate, browser_snapshot, browser_click, browser_type, browser_read, and browser_screenshot as needed. If the user asks to search in the browser and then provide a screenshot, start by navigating to a relevant page and use browser_screenshot after the page is ready. Only use take_screenshot for a desktop or full-screen capture.' }];
+  }
+  if (profile.internetScore >= 3) {
+    return [{ role: 'system', content: 'The latest user request appears to need fresh web information. Prefer using web_search first, then web_fetch when a result page needs confirmation. Do not claim you lack internet access unless a tool call actually fails.' }];
+  }
+  return [];
+}
+function normalizeWhitespace(value: string): string {
+  return value.replace(/\s+/g, ' ').trim();
 }
 
 function shouldClose(): boolean {
@@ -381,23 +1012,14 @@ function shouldClose(): boolean {
 function drainIpcInput(): string[] {
   try {
     fs.mkdirSync(IPC_INPUT_DIR, { recursive: true });
-    const files = fs
-      .readdirSync(IPC_INPUT_DIR)
-      .filter((file) => file.endsWith('.json'))
-      .sort();
-
+    const files = fs.readdirSync(IPC_INPUT_DIR).filter((file) => file.endsWith('.json')).sort();
     const messages: string[] = [];
     for (const file of files) {
       const filePath = path.join(IPC_INPUT_DIR, file);
       try {
-        const data = JSON.parse(fs.readFileSync(filePath, 'utf8')) as {
-          type?: string;
-          text?: string;
-        };
+        const data = JSON.parse(fs.readFileSync(filePath, 'utf8')) as { type?: string; text?: string };
         fs.unlinkSync(filePath);
-        if (data.type === 'message' && data.text) {
-          messages.push(data.text);
-        }
+        if (data.type === 'message' && data.text) messages.push(data.text);
       } catch (err) {
         log(`Failed to process input file ${file}: ${err instanceof Error ? err.message : String(err)}`);
         try {
@@ -432,52 +1054,128 @@ function waitForIpcMessage(): Promise<string | null> {
   });
 }
 
-function parseToolCall(text: string): ToolCall | null {
-  const trimmed = text.trim();
-  const withoutFences = trimmed
-    .replace(/^```(?:json)?\s*/i, '')
-    .replace(/\s*```$/, '');
+function isToolCallShape(value: unknown): value is ToolCall {
+  if (!value || typeof value !== 'object') return false;
+  const parsed = value as ToolCall;
+  if (typeof parsed.tool !== 'string' || !SUPPORTED_TOOLS.includes(parsed.tool as SupportedTool)) return false;
+  return Boolean(parsed.input && typeof parsed.input === 'object');
+}
 
+function normalizeParsedToolCall(value: unknown): ToolCall | null {
+  if (!value || typeof value !== 'object') return null;
+  const parsed = value as { tool?: unknown; input?: unknown };
+  if (isToolCallShape(parsed)) return parsed;
+  if (typeof parsed.tool !== 'string' || !parsed.input || typeof parsed.input !== 'object') {
+    return null;
+  }
+
+  const toolAliasMap: Partial<Record<string, SupportedTool>> = {
+    web_browse: 'browser_navigate',
+    browse_web: 'browser_navigate',
+    open_webpage: 'browser_navigate',
+    open_website: 'browser_navigate',
+  };
+
+  const mappedTool = toolAliasMap[parsed.tool.toLowerCase()];
+  if (!mappedTool) return null;
+
+  const normalized: ToolCall = {
+    tool: mappedTool,
+    input: parsed.input as ToolCall['input'],
+  };
+  return isToolCallShape(normalized) ? normalized : null;
+}
+
+function tryParseToolCallCandidate(candidate: string): ToolCall | null {
   try {
-    const parsed = JSON.parse(withoutFences) as ToolCall;
-    if (!parsed || typeof parsed !== 'object') return null;
-    if (typeof parsed.tool !== 'string' || !SUPPORTED_TOOLS.includes(parsed.tool as ToolCall['tool'])) {
-      return null;
-    }
-    if (!parsed.input || typeof parsed.input !== 'object') return null;
-    return parsed;
+    const parsed = JSON.parse(candidate);
+    return normalizeParsedToolCall(parsed);
   } catch {
     return null;
   }
+}
+
+function extractJsonObjectCandidates(text: string): string[] {
+  const candidates: string[] = [];
+  let depth = 0;
+  let start = -1;
+  let inString = false;
+  let escaped = false;
+
+  for (let index = 0; index < text.length; index++) {
+    const char = text[index];
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+    if (char === '\\') {
+      escaped = true;
+      continue;
+    }
+    if (char === '"') {
+      inString = !inString;
+      continue;
+    }
+    if (inString) continue;
+    if (char === '{') {
+      if (depth === 0) start = index;
+      depth += 1;
+      continue;
+    }
+    if (char === '}') {
+      if (depth === 0) continue;
+      depth -= 1;
+      if (depth === 0 && start !== -1) {
+        candidates.push(text.slice(start, index + 1));
+        start = -1;
+      }
+    }
+  }
+  return candidates;
+}
+
+function parseToolCall(text: string): ToolCall | null {
+  const trimmed = text.trim();
+  const direct = tryParseToolCallCandidate(trimmed);
+  if (direct) return direct;
+
+  const withoutFences = trimmed.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '').trim();
+  const fenced = tryParseToolCallCandidate(withoutFences);
+  if (fenced) return fenced;
+
+  for (const candidate of extractJsonObjectCandidates(withoutFences)) {
+    const parsed = tryParseToolCallCandidate(candidate);
+    if (parsed) return parsed;
+  }
+  return null;
+}
+
+function sanitizeHistory(messages: ConversationMessage[]): ConversationMessage[] {
+  return messages.filter((message) => {
+    if (message.content.includes(TOOL_RESULT_MARKER)) return false;
+    if (message.role === 'assistant') {
+      if (STALE_LIMITATION_PATTERN.test(message.content)) return false;
+      if (parseToolCall(message.content)) return false;
+    }
+    return true;
+  });
 }
 
 function writeHostToolRequest(call: ToolCall): string {
   fs.mkdirSync(HOST_TOOL_REQUEST_DIR, { recursive: true });
   fs.mkdirSync(HOST_TOOL_RESULT_DIR, { recursive: true });
   const id = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-  const payload = {
-    id,
-    type: call.tool,
-    app: call.input.app,
-    timestamp: new Date().toISOString(),
-  };
-  fs.writeFileSync(
-    path.join(HOST_TOOL_REQUEST_DIR, `${id}.json`),
-    JSON.stringify(payload, null, 2),
-  );
+  fs.writeFileSync(path.join(HOST_TOOL_REQUEST_DIR, `${id}.json`), JSON.stringify({ id, type: call.tool, app: call.input.app, skill: call.input.skill, skillPath: call.input.skillPath, timestamp: new Date().toISOString() }, null, 2));
   return id;
 }
 
 async function waitForHostToolResult(id: string): Promise<HostToolResult> {
   const resultPath = path.join(HOST_TOOL_RESULT_DIR, `${id}.json`);
   const timeoutAt = Date.now() + 30000;
-
   while (Date.now() < timeoutAt) {
     if (fs.existsSync(resultPath)) {
       try {
-        const parsed = JSON.parse(
-          fs.readFileSync(resultPath, 'utf8'),
-        ) as HostToolResult;
+        const parsed = JSON.parse(fs.readFileSync(resultPath, 'utf8')) as HostToolResult;
         fs.unlinkSync(resultPath);
         return parsed;
       } catch (err) {
@@ -486,42 +1184,87 @@ async function waitForHostToolResult(id: string): Promise<HostToolResult> {
     }
     await new Promise((resolve) => setTimeout(resolve, 200));
   }
-
   throw new Error('Host tool timed out');
 }
 
 async function executeHostTool(call: ToolCall): Promise<ExecutedHostToolResult> {
   const requestId = writeHostToolRequest(call);
   const result = await waitForHostToolResult(requestId);
-  if (!result.ok) {
-    throw new Error(result.message || ('Host tool failed: ' + call.tool));
-  }
+  if (!result.ok) throw new Error(result.message || ('Host tool failed: ' + call.tool));
 
   if (call.tool === 'take_screenshot') {
     return {
       raw: result,
-      summary: [
-        'HOST_SCREENSHOT_OK',
-        'MESSAGE: ' + result.message,
-        result.screenshotPath ? 'SCREENSHOT_PATH: ' + result.screenshotPath : '',
-        result.screenshotUrl ? 'SCREENSHOT_URL: ' + result.screenshotUrl : '',
-      ]
-        .filter(Boolean)
-        .join('\n'),
+      summary: ['HOST_SCREENSHOT_OK', 'MESSAGE: ' + result.message, result.screenshotPath ? 'SCREENSHOT_PATH: ' + result.screenshotPath : '', result.screenshotUrl ? 'SCREENSHOT_URL: ' + result.screenshotUrl : ''].filter(Boolean).join('\n'),
     };
   }
 
-  return {
-    raw: result,
-    summary: 'HOST_ACTION_OK\nMESSAGE: ' + result.message,
-  };
+  return { raw: result, summary: 'HOST_ACTION_OK\nMESSAGE: ' + result.message };
+}
+
+function runCommand(
+  file: string,
+  args: string[],
+  cwd: string,
+): Promise<{ stdout: string; stderr: string }> {
+  return new Promise((resolve, reject) => {
+    execFile(file, args, { cwd, env: process.env }, (error, stdout, stderr) => {
+      if (error) {
+        reject(
+          new Error(
+            [error.message, stderr.trim(), stdout.trim()].filter(Boolean).join('\n'),
+          ),
+        );
+        return;
+      }
+      resolve({ stdout, stderr });
+    });
+  });
+}
+
+function sanitizeFilePrefix(value: string): string {
+  return value
+    .replace(/[^\w\u4e00-\u9fff-]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 48);
+}
+
+async function executeEastmoneyTool(call: ToolCall): Promise<string> {
+  const keyword = (call.input.keyword || call.input.query || '').trim();
+  if (!keyword) {
+    throw new Error('eastmoney_select_stock requires a keyword');
+  }
+
+  const args = [
+    keyword,
+    '--output-dir',
+    'eastmoney-output',
+    '--prefix',
+    sanitizeFilePrefix(keyword) || 'eastmoney',
+  ];
+
+  const market = (call.input.market || '').trim();
+  if (market) {
+    args.push('--market', market);
+  }
+
+  const { stdout } = await runCommand(
+    'eastmoney-select-stock',
+    args,
+    '/workspace/group',
+  );
+  return stdout.trim();
 }
 
 function stringifyToolOutput(value: unknown): string {
-  if (typeof value === 'string') {
-    return value;
-  }
-  return JSON.stringify(value, null, 2);
+  return typeof value === 'string' ? value : JSON.stringify(value, null, 2);
+}
+
+function makeToolResultMessage(tool: SupportedTool, toolOutput: string): ConversationMessage {
+  return {
+    role: 'user',
+    content: [TOOL_RESULT_MARKER, `Tool: ${tool}`, 'Source: runtime', '', 'Payload:', toolOutput, '', TOOL_RESULT_CONTINUATION_HINT].join('\n'),
+  };
 }
 
 async function executeBrowserTool(call: ToolCall): Promise<string> {
@@ -533,16 +1276,9 @@ async function executeBrowserTool(call: ToolCall): Promise<string> {
     case 'browser_click':
       return stringifyToolOutput(await browserClick(call.input.elementId || ''));
     case 'browser_type':
-      return stringifyToolOutput(
-        await browserType(call.input.elementId || '', call.input.text || '', {
-          clear: Boolean(call.input.clear),
-          submit: Boolean(call.input.submit),
-        }),
-      );
+      return stringifyToolOutput(await browserType(call.input.elementId || '', call.input.text || '', { clear: Boolean(call.input.clear), submit: Boolean(call.input.submit) }));
     case 'browser_scroll':
-      return stringifyToolOutput(
-        await browserScroll(call.input.direction === 'up' ? 'up' : 'down', call.input.amount),
-      );
+      return stringifyToolOutput(await browserScroll(call.input.direction === 'up' ? 'up' : 'down', call.input.amount));
     case 'browser_back':
       return stringifyToolOutput(await browserBack());
     case 'browser_forward':
@@ -552,94 +1288,111 @@ async function executeBrowserTool(call: ToolCall): Promise<string> {
     case 'browser_read':
       return stringifyToolOutput(await browserRead());
     case 'browser_screenshot':
-      return stringifyToolOutput(
-        await browserScreenshot({
-          fullPage: call.input.fullPage,
-          path: call.input.path,
-        }),
-      );
+      return stringifyToolOutput(await browserScreenshot({ fullPage: call.input.fullPage, path: call.input.path }));
     case 'browser_links':
       return stringifyToolOutput(await browserLinks());
     case 'browser_press':
       return stringifyToolOutput(await browserPress(call.input.key || ''));
     case 'browser_select':
-      return stringifyToolOutput(
-        await browserSelect(call.input.elementId || '', call.input.value || ''),
-      );
+      return stringifyToolOutput(await browserSelect(call.input.elementId || '', call.input.value || ''));
     case 'browser_hover':
       return stringifyToolOutput(await browserHover(call.input.elementId || ''));
     case 'browser_wait_for_text':
-      return stringifyToolOutput(
-        await browserWaitForText(call.input.text || '', call.input.timeoutMs),
-      );
+      return stringifyToolOutput(await browserWaitForText(call.input.text || '', call.input.timeoutMs));
     default:
       throw new Error('Unsupported browser tool: ' + call.tool);
   }
 }
+
 function hasChinese(text: string): boolean {
   return /[\u3400-\u9fff]/.test(text);
 }
 
-async function finalizeDirectHostAction(
-  input: ContainerInput,
-  sessionId: string,
-  history: ConversationMessage[],
-  systemPrompt: string,
-  prompt: string,
-  reply: string,
-  onStream?: (chunk: StreamToken) => void | Promise<void>,
-): Promise<string> {
-  if (onStream) {
-    await onStream({ kind: 'content', value: reply });
-  }
-
-  const finalMessages = trimHistory([
-    { role: 'system', content: systemPrompt },
-    ...history,
-    { role: 'user', content: prompt },
-    { role: 'assistant', content: reply },
-  ]);
-  saveHistory(sessionId, finalMessages);
+async function finalizeDirectHostAction(sessionId: string, history: ConversationMessage[], prompt: string, reply: string, onStream?: (chunk: StreamToken) => void | Promise<void>): Promise<string> {
+  if (onStream) await onStream({ kind: 'content', value: reply });
+  persistConversationTurn(sessionId, history, prompt, reply);
   return reply;
 }
 
-function buildDirectHostActionReply(
-  call: ToolCall,
-  result: ExecutedHostToolResult,
-  prompt: string,
-  input: ContainerInput,
-): string {
+function buildDirectHostActionReply(call: ToolCall, result: ExecutedHostToolResult, prompt: string): string {
   const prefersChinese = hasChinese(prompt);
   const isWebClient = prompt.includes('<client channel="web"');
-
   if (call.tool === 'take_screenshot') {
-    const intro = prefersChinese
-      ? '\u597d\u7684\uff0c\u622a\u56fe\u5df2\u6210\u529f\u6355\u83b7\uff01'
-      : 'Done. I captured the screenshot successfully.';
-    const imageLine = isWebClient && result.raw.screenshotUrl
-      ? `\n\n![Screenshot](${result.raw.screenshotUrl})`
-      : '';
+    const intro = prefersChinese ? '好的，截图已成功捕获！' : 'Done. I captured the screenshot successfully.';
+    const imageLine = isWebClient && result.raw.screenshotUrl ? `\n\n![Screenshot](${result.raw.screenshotUrl})` : '';
     return intro + imageLine;
   }
+  const appName = call.input.app || (prefersChinese ? '目标应用' : 'the requested app');
+  return prefersChinese ? `好的，已经尝试为你打开 ${appName}。` : `Done. I attempted to open ${appName}.`;
+}
 
-  const appName = call.input.app || (prefersChinese ? '\u76ee\u6807\u5e94\u7528' : 'the requested app');
-  return prefersChinese
-    ? `\u597d\u7684\uff0c\u5df2\u7ecf\u5c1d\u8bd5\u4e3a\u4f60\u6253\u5f00 ${appName}\u3002`
-    : `Done. I attempted to open ${appName}.`;
+function buildDirectBrowserScreenshotReply(toolOutput: string, prompt: string): string | null {
+  try {
+    const parsed = JSON.parse(toolOutput) as { screenshotUrl?: string; path?: string; title?: string; url?: string };
+    const prefersChinese = hasChinese(prompt);
+    const isWebClient = prompt.includes('<client channel="web"');
+    const intro = prefersChinese ? '\u597d\u7684\uff0c\u7f51\u9875\u622a\u56fe\u5df2\u5b8c\u6210\u3002' : 'Done. I captured the webpage screenshot.';
+    const details = parsed.title ? (prefersChinese ? `\n\n\u9875\u9762\uff1a${parsed.title}` : `\n\nPage: ${parsed.title}`) : '';
+    const imageLine = isWebClient && parsed.screenshotUrl ? `\n\n![Screenshot](${parsed.screenshotUrl})` : '';
+    const pathLine = !imageLine && parsed.path ? (prefersChinese ? `\n\n\u622a\u56fe\u6587\u4ef6\uff1a${parsed.path}` : `\n\nScreenshot file: ${parsed.path}`) : '';
+    return intro + details + imageLine + pathLine;
+  } catch {
+    return null;
+  }
 }
 
 async function executeToolCall(call: ToolCall): Promise<string> {
-  if (call.tool === 'web_search') {
-    return webSearch(call.input.query || '');
-  }
-  if (call.tool === 'web_fetch') {
-    return webFetch(call.input.url || '');
-  }
-  if (call.tool.startsWith('browser_')) {
-    return executeBrowserTool(call);
-  }
+  if (call.tool === 'eastmoney_select_stock') return executeEastmoneyTool(call);
+  if (call.tool === 'web_search') return webSearch(call.input.query || '');
+  if (call.tool === 'web_fetch') return webFetch(call.input.url || '');
+  if (call.tool.startsWith('browser_')) return executeBrowserTool(call);
   const hostResult = await executeHostTool(call);
   return hostResult.summary;
+}
+
+function getToolCallSignature(call: ToolCall): string {
+  return `${call.tool}:${JSON.stringify(call.input || {})}`;
+}
+
+function getMaxToolSteps(prompt: string): number {
+  return isLikelyBrowserWorkflowRequest(prompt) ? BROWSER_WORKFLOW_MAX_TOOL_STEPS : DEFAULT_MAX_TOOL_STEPS;
+}
+
+function shouldShortCircuitHostAction(decision: FirstActionDecision): boolean {
+  return decision.kind === 'tool' && decision.source !== 'model' && isHostTool(decision.toolCall.tool);
+}
+
+function isElementTargetedBrowserTool(tool: SupportedTool): boolean {
+  return ELEMENT_TARGETED_BROWSER_TOOLS.has(tool);
+}
+
+function buildBrowserFollowUpFallback(prompt: string, hasBrowserSnapshot: boolean): ToolCall | null {
+  const latest = extractLatestUserText(prompt);
+  if (detectScreenshotTarget(latest) === 'browser-page') {
+    return hasBrowserSnapshot
+      ? { tool: 'browser_screenshot', input: {} }
+      : { tool: 'browser_snapshot', input: {} };
+  }
+
+  if (isLikelyBrowserSearchRequest(prompt)) {
+    return hasBrowserSnapshot
+      ? { tool: 'browser_screenshot', input: {} }
+      : { tool: 'browser_snapshot', input: {} };
+  }
+
+  return hasBrowserSnapshot ? null : { tool: 'browser_snapshot', input: {} };
+}
+
+function shouldPreferBrowserPageScreenshot(prompt: string): boolean {
+  const latest = extractLatestUserText(prompt);
+  const normalized = normalizeIntentText(latest);
+  const target = detectScreenshotTarget(latest);
+  const mentionsScreenshot =
+    normalized.includes('screenshot') ||
+    normalized.includes('screen shot') ||
+    normalized.includes('\u622a\u56fe') ||
+    normalized.includes('\u622a\u5c4f');
+  return target === 'browser-page' || (mentionsScreenshot && isLikelyBrowserWorkflowRequest(prompt));
 }
 
 async function askModel(messages: ConversationMessage[]): Promise<{
@@ -650,20 +1403,11 @@ async function askModel(messages: ConversationMessage[]): Promise<{
   evalCount: number;
 }> {
   const model = (process.env.OLLAMA_MODEL || '').trim();
-  if (!model) {
-    throw new Error('OLLAMA_MODEL is not configured');
-  }
+  if (!model) throw new Error('OLLAMA_MODEL is not configured');
 
-  const body: Record<string, unknown> = {
-    model,
-    messages,
-    stream: false,
-  };
-
+  const body: Record<string, unknown> = { model, messages, stream: false };
   const temperature = Number(process.env.OLLAMA_TEMPERATURE || '');
-  if (!Number.isNaN(temperature)) {
-    body.options = { temperature };
-  }
+  if (!Number.isNaN(temperature)) body.options = { temperature };
 
   const { response, host } = await ollamaFetch('/api/chat', {
     method: 'POST',
@@ -676,16 +1420,9 @@ async function askModel(messages: ConversationMessage[]): Promise<{
     throw new Error(`Ollama error from ${host} (${response.status}): ${errorText}`);
   }
 
-  const data = (await response.json()) as {
-    message?: { content?: string };
-    prompt_eval_count?: number;
-    eval_count?: number;
-  };
-
+  const data = (await response.json()) as { message?: { content?: string }; prompt_eval_count?: number; eval_count?: number };
   const text = data.message?.content?.trim();
-  if (!text) {
-    throw new Error('Ollama returned an empty response');
-  }
+  if (!text) throw new Error('Ollama returned an empty response');
 
   return {
     text,
@@ -696,28 +1433,13 @@ async function askModel(messages: ConversationMessage[]): Promise<{
   };
 }
 
-async function streamModelAnswer(
-  messages: ConversationMessage[],
-  onToken: (token: StreamToken) => void | Promise<void>,
-  options?: {
-    includeThinking?: boolean;
-  },
-): Promise<{ text: string; host: string; model: string }> {
+async function streamModelAnswer(messages: ConversationMessage[], onToken: (token: StreamToken) => void | Promise<void>, options?: { includeThinking?: boolean }): Promise<{ text: string; host: string; model: string }> {
   const model = (process.env.OLLAMA_MODEL || '').trim();
-  if (!model) {
-    throw new Error('OLLAMA_MODEL is not configured');
-  }
+  if (!model) throw new Error('OLLAMA_MODEL is not configured');
 
-  const body: Record<string, unknown> = {
-    model,
-    messages,
-    stream: true,
-  };
-
+  const body: Record<string, unknown> = { model, messages, stream: true };
   const temperature = Number(process.env.OLLAMA_TEMPERATURE || '');
-  if (!Number.isNaN(temperature)) {
-    body.options = { temperature };
-  }
+  if (!Number.isNaN(temperature)) body.options = { temperature };
 
   const { response, host } = await ollamaFetch('/api/chat', {
     method: 'POST',
@@ -745,14 +1467,9 @@ async function streamModelAnswer(
     for (const line of lines) {
       const trimmed = line.trim();
       if (!trimmed) continue;
-      const data = JSON.parse(trimmed) as {
-        message?: { content?: string; thinking?: string };
-        done?: boolean;
-      };
+      const data = JSON.parse(trimmed) as { message?: { content?: string; thinking?: string } };
       const thinkingToken = data.message?.thinking || '';
-      if (thinkingToken && includeThinking) {
-        await onToken({ kind: 'thinking', value: thinkingToken });
-      }
+      if (thinkingToken && includeThinking) await onToken({ kind: 'thinking', value: thinkingToken });
       const contentToken = data.message?.content || '';
       if (contentToken) {
         text += contentToken;
@@ -762,13 +1479,9 @@ async function streamModelAnswer(
 
     if (done) {
       if (buffer.trim()) {
-        const data = JSON.parse(buffer.trim()) as {
-          message?: { content?: string; thinking?: string };
-        };
+        const data = JSON.parse(buffer.trim()) as { message?: { content?: string; thinking?: string } };
         const thinkingToken = data.message?.thinking || '';
-        if (thinkingToken && includeThinking) {
-          await onToken({ kind: 'thinking', value: thinkingToken });
-        }
+        if (thinkingToken && includeThinking) await onToken({ kind: 'thinking', value: thinkingToken });
         const contentToken = data.message?.content || '';
         if (contentToken) {
           text += contentToken;
@@ -782,140 +1495,178 @@ async function streamModelAnswer(
   return { text: text.trim(), host, model };
 }
 
-async function generateReply(
-  input: ContainerInput,
-  sessionId: string,
-  prompt: string,
-  onStream?: (chunk: StreamToken) => void | Promise<void>,
-): Promise<string> {
-  const history = sanitizeHistory(loadHistory(sessionId)).filter(
-    (message) => message.role !== 'system',
-  );
-  const systemPrompt = buildSystemPrompt(input);
+async function generateReply(input: ContainerInput, sessionId: string, prompt: string, onStream?: (chunk: StreamToken) => void | Promise<void>): Promise<string> {
+  const history = sanitizeHistory(loadHistory(sessionId)).filter((message) => message.role !== 'system');
   const messages: ConversationMessage[] = [
-    { role: 'system', content: systemPrompt },
+    { role: 'system', content: buildSystemPrompt(input) },
+    ...buildRuntimeHintMessages(prompt),
     ...history,
     { role: 'user', content: prompt },
   ];
 
-  if (isLikelyScreenshotRequest(prompt)) {
-    log('Direct host-action shortcut matched screenshot request');
-    const call = {
-      tool: 'take_screenshot',
-      input: {},
-    } as ToolCall;
-    const hostResult = await executeHostTool(call);
-    const reply = buildDirectHostActionReply(call, hostResult, prompt, input);
-    return finalizeDirectHostAction(input, sessionId, history, systemPrompt, prompt, reply, onStream);
-  }
+  const maxToolSteps = getMaxToolSteps(prompt);
+  let previousSignature = '';
+  let repeatedToolCount = 0;
+  let hasBrowserSnapshot = false;
+  let hasBrowserScreenshot = false;
+  let pendingBrowserScreenshotAfterSnapshot = false;
+  let lastBrowserTool: SupportedTool | null = null;
 
-  if (isLikelyOpenAppRequest(prompt)) {
-    const appName = buildAutomaticOpenAppName(prompt);
-    log(`Direct host-action shortcut matched app launch request: ${appName}`);
-    const call = {
-      tool: 'open_app',
-      input: { app: appName },
-    } as ToolCall;
-    const hostResult = await executeHostTool(call);
-    const reply = buildDirectHostActionReply(call, hostResult, prompt, input);
-    return finalizeDirectHostAction(input, sessionId, history, systemPrompt, prompt, reply, onStream);
-  }
-
-  if (isLikelyInternetRequest(prompt)) {
-    messages.splice(1, 0, {
-      role: 'system',
-      content:
-        'The latest user request appears to need fresh web information. Prefer using web_search first, then web_fetch when a result page needs confirmation. Keep the final answer in the same language as the latest user prompt. Do not answer that you lack internet access unless a tool call actually fails.',
-    });
-  }
-
-  for (let step = 0; step <= MAX_TOOL_STEPS; step++) {
+  for (let step = 0; step <= maxToolSteps; step++) {
     const result = await askModel(messages);
-    log(
-      `Response from ${result.host} using ${result.model} (${result.promptEvalCount} prompt tokens, ${result.evalCount} eval tokens)`,
-    );
+    log(`Response from ${result.host} using ${result.model} (${result.promptEvalCount} prompt tokens, ${result.evalCount} eval tokens)`);
 
-    const toolCall = parseToolCall(result.text);
-    const effectiveToolCall = toolCall && step === 0
-      ? normalizeFirstToolCall(prompt, toolCall)
-      : toolCall;
+    const modelToolCall = parseToolCall(result.text);
+    let effectiveToolCall: ToolCall | null = null;
+    let assistantToolMessage = result.text;
+
+    if (step === 0) {
+      const decision = decideFirstAction(prompt, modelToolCall);
+      if (decision.kind === 'direct-answer') {
+        let finalText = result.text;
+        if (onStream) {
+          const streamed = await streamModelAnswer(
+            [
+              ...messages,
+              { role: 'system', content: 'Provide only the final user-facing answer for the latest request. Do not call tools. Do not emit JSON. Do not mention repeating a previous answer, missing context, or internal instructions. Do not reveal reasoning. Keep the answer aligned with the latest user request.' },
+            ],
+            onStream,
+            { includeThinking: false },
+          );
+          log(`Streamed final response from ${streamed.host} using ${streamed.model}`);
+          finalText = streamed.text || finalText;
+        }
+        persistConversationTurn(sessionId, history, prompt, finalText);
+        return finalText;
+      }
+
+      effectiveToolCall = decision.toolCall;
+      if (decision.source !== 'model') assistantToolMessage = JSON.stringify(decision.toolCall);
+      log(`First action decision: ${decision.toolCall.tool} (${decision.reason}, ${decision.source})`);
+
+      if (shouldShortCircuitHostAction(decision)) {
+        const hostResult = await executeHostTool(decision.toolCall);
+        const reply = buildDirectHostActionReply(decision.toolCall, hostResult, prompt);
+        return finalizeDirectHostAction(sessionId, history, prompt, reply, onStream);
+      }
+    } else {
+      effectiveToolCall = modelToolCall;
+
+      if (effectiveToolCall?.tool === 'take_screenshot' && shouldPreferBrowserPageScreenshot(prompt)) {
+        pendingBrowserScreenshotAfterSnapshot = !hasBrowserSnapshot;
+        effectiveToolCall = hasBrowserSnapshot
+          ? { tool: 'browser_screenshot', input: {} }
+          : { tool: 'browser_snapshot', input: {} };
+        assistantToolMessage = JSON.stringify(effectiveToolCall);
+        log(`Redirecting take_screenshot to ${effectiveToolCall.tool} for browser-page screenshot request`);
+      }
+
+      if (effectiveToolCall && isBrowserTool(effectiveToolCall.tool)) {
+        if (isElementTargetedBrowserTool(effectiveToolCall.tool) && !hasBrowserSnapshot) {
+          log(`Guarding browser action ${effectiveToolCall.tool}: inserting browser_snapshot before element-targeted action`);
+          effectiveToolCall = { tool: 'browser_snapshot', input: {} };
+          assistantToolMessage = JSON.stringify(effectiveToolCall);
+        }
+
+        if (effectiveToolCall.tool === 'browser_screenshot' && !hasBrowserSnapshot && lastBrowserTool === 'browser_navigate') {
+          pendingBrowserScreenshotAfterSnapshot = true;
+          log('Guarding browser_screenshot: inserting browser_snapshot after initial navigation');
+          effectiveToolCall = { tool: 'browser_snapshot', input: {} };
+          assistantToolMessage = JSON.stringify(effectiveToolCall);
+        }
+      }
+    }
 
     if (!effectiveToolCall) {
-      if (step === 0 && isLikelyScreenshotRequest(prompt)) {
-        log('No tool call emitted for likely screenshot request, auto-running take_screenshot');
-        const call = {
-          tool: 'take_screenshot',
-          input: {},
-        } as ToolCall;
-        const hostResult = await executeHostTool(call);
-        const reply = buildDirectHostActionReply(call, hostResult, prompt, input);
-        return finalizeDirectHostAction(input, sessionId, history, systemPrompt, prompt, reply, onStream);
+      if (step > 0 && pendingBrowserScreenshotAfterSnapshot && hasBrowserSnapshot && !hasBrowserScreenshot) {
+        effectiveToolCall = { tool: 'browser_screenshot', input: {} };
+        assistantToolMessage = JSON.stringify(effectiveToolCall);
+        pendingBrowserScreenshotAfterSnapshot = false;
+        log('Completing deferred webpage screenshot with browser_screenshot');
       }
 
-      if (step === 0 && isLikelyOpenAppRequest(prompt)) {
-        const appName = buildAutomaticOpenAppName(prompt);
-        log(`No tool call emitted for likely app launch request, auto-running open_app: ${appName}`);
-        const call = {
-          tool: 'open_app',
-          input: { app: appName },
-        } as ToolCall;
-        const hostResult = await executeHostTool(call);
-        const reply = buildDirectHostActionReply(call, hostResult, prompt, input);
-        return finalizeDirectHostAction(input, sessionId, history, systemPrompt, prompt, reply, onStream);
+      if (
+        !effectiveToolCall &&
+        step > 0 &&
+        shouldPreferBrowserPageScreenshot(prompt) &&
+        !hasBrowserScreenshot &&
+        lastBrowserTool &&
+        ['browser_navigate', 'browser_snapshot', 'browser_read', 'browser_links'].includes(lastBrowserTool)
+      ) {
+        effectiveToolCall = hasBrowserSnapshot
+          ? { tool: 'browser_screenshot', input: {} }
+          : { tool: 'browser_snapshot', input: {} };
+        assistantToolMessage = JSON.stringify(effectiveToolCall);
+        log(`No webpage screenshot produced yet, inserting ${effectiveToolCall.tool}`);
       }
 
-      if (step === 0 && isLikelyInternetRequest(prompt)) {
-        const autoQuery = buildAutomaticSearchQuery(prompt);
-        log(`No tool call emitted for likely internet request, auto-searching: ${autoQuery}`);
-        const autoToolOutput = await webSearch(autoQuery);
-        messages.push({
-          role: 'user',
-          content:
-            `Automatic web search results for the latest user request:\n${autoToolOutput}\n\nUse these results to answer the user directly. Prefer citing the exact source titles and URLs you rely on. Request web_fetch if you need to inspect one result in more detail.`,
-        });
-        continue;
+      if (!effectiveToolCall && step > 0 && lastBrowserTool === 'browser_navigate') {
+        const browserFallback = buildBrowserFollowUpFallback(prompt, hasBrowserSnapshot);
+        if (browserFallback) {
+          log(`No follow-up tool emitted after browser_navigate, inserting ${browserFallback.tool}`);
+          effectiveToolCall = browserFallback;
+          assistantToolMessage = JSON.stringify(browserFallback);
+        }
       }
-      let finalText = result.text;
+
+      if (!effectiveToolCall) {
+        let finalText = result.text;
       if (onStream) {
-        const streamMessages: ConversationMessage[] = [
-          ...messages,
-          {
-            role: 'system',
-            content:
-              'Provide only the final user-facing answer for the latest request. Do not call tools. Do not emit JSON. Do not mention repeating a previous answer, missing context, or internal instructions. Do not reveal reasoning. Keep the answer aligned with the latest user request.',
-          },
-        ];
-        const streamed = await streamModelAnswer(streamMessages, onStream, { includeThinking: false });
+        const streamed = await streamModelAnswer(
+          [
+            ...messages,
+            { role: 'system', content: 'Provide only the final user-facing answer for the latest request. Do not call tools. Do not emit JSON. Do not mention repeating a previous answer, missing context, or internal instructions. Do not reveal reasoning. Keep the answer aligned with the latest user request.' },
+          ],
+          onStream,
+          { includeThinking: false },
+        );
         log(`Streamed final response from ${streamed.host} using ${streamed.model}`);
         finalText = streamed.text || finalText;
       }
-
-      const finalMessages = trimHistory([
-        { role: 'system', content: systemPrompt },
-        ...history,
-        { role: 'user', content: prompt },
-        ...messages.slice(1 + history.length + 1),
-        { role: 'assistant', content: finalText },
-      ]);
-      saveHistory(sessionId, finalMessages);
-      return finalText;
+        persistConversationTurn(sessionId, history, prompt, finalText);
+        return finalText;
+      }
     }
 
-    if (step === MAX_TOOL_STEPS) {
-      throw new Error('Tool loop exceeded maximum number of steps');
+    if (step === maxToolSteps) {
+      throw new Error(`Tool loop exceeded maximum number of steps (${maxToolSteps})`);
     }
 
-        if (toolCall && effectiveToolCall && toolCall.tool !== effectiveToolCall.tool) {
-      log(`Overriding first tool call from ${toolCall.tool} to ${effectiveToolCall.tool} based on user intent`);
+    const signature = getToolCallSignature(effectiveToolCall);
+    if (signature === previousSignature) {
+      repeatedToolCount += 1;
+      if (repeatedToolCount >= MAX_REPEATED_TOOL_CALLS) {
+        throw new Error(`Tool loop repeated the same action too many times: ${signature}`);
+      }
+    } else {
+      previousSignature = signature;
+      repeatedToolCount = 0;
     }
 
     log(`Executing tool: ${effectiveToolCall.tool}`);
     const toolOutput = await executeToolCall(effectiveToolCall);
-    messages.push({ role: 'assistant', content: result.text });
-    messages.push({
-      role: 'user',
-      content: `Tool result for ${effectiveToolCall.tool}:\n${toolOutput}\n\nNow continue and answer the user. Give the answer first, then include a compact Sources section with the exact titles and URLs you used unless the user asked for a minimal-format response. Request another tool only if still necessary.`,
-    });
+    if (effectiveToolCall.tool === 'browser_screenshot') {
+      const directScreenshotReply = buildDirectBrowserScreenshotReply(toolOutput, prompt);
+      if (directScreenshotReply) {
+        if (onStream) {
+          await onStream({ kind: 'content', value: directScreenshotReply });
+        }
+        persistConversationTurn(sessionId, history, prompt, directScreenshotReply);
+        return directScreenshotReply;
+      }
+    }
+    if (effectiveToolCall.tool === 'browser_snapshot') {
+      hasBrowserSnapshot = true;
+    }
+    if (effectiveToolCall.tool === 'browser_screenshot') {
+      hasBrowserScreenshot = true;
+      pendingBrowserScreenshotAfterSnapshot = false;
+    }
+    if (isBrowserTool(effectiveToolCall.tool)) {
+      lastBrowserTool = effectiveToolCall.tool;
+    }
+    messages.push({ role: 'assistant', content: assistantToolMessage });
+    messages.push(makeToolResultMessage(effectiveToolCall.tool, toolOutput));
   }
 
   throw new Error('No final response produced');
@@ -929,11 +1680,7 @@ async function main(): Promise<void> {
     input = JSON.parse(stdinData) as ContainerInput;
     log(`Received input for group: ${input.groupFolder}`);
   } catch (err) {
-    writeOutput({
-      status: 'error',
-      result: null,
-      error: `Failed to parse input: ${err instanceof Error ? err.message : String(err)}`,
-    });
+    writeOutput({ status: 'error', result: null, error: `Failed to parse input: ${err instanceof Error ? err.message : String(err)}` });
     process.exit(1);
     return;
   }
@@ -947,14 +1694,10 @@ async function main(): Promise<void> {
 
   const sessionId = getSessionId(input);
   let prompt = input.prompt;
-  if (input.isScheduledTask) {
-    prompt = `[SCHEDULED TASK]\n\n${prompt}`;
-  }
+  if (input.isScheduledTask) prompt = `[SCHEDULED TASK]\n\n${prompt}`;
 
   const pending = drainIpcInput();
-  if (pending.length > 0) {
-    prompt += `\n${pending.join('\n')}`;
-  }
+  if (pending.length > 0) prompt += `\n${pending.join('\n')}`;
 
   try {
     while (true) {
@@ -964,40 +1707,21 @@ async function main(): Promise<void> {
         prompt,
         input.streamToHost
           ? async (chunk) => {
-              writeOutput({
-                status: 'success',
-                result: chunk.value,
-                newSessionId: sessionId,
-                stream: true,
-                streamKind: chunk.kind,
-                done: false,
-              });
+              writeOutput({ status: 'success', result: chunk.value, newSessionId: sessionId, stream: true, streamKind: chunk.kind, done: false });
             }
           : undefined,
       );
-      writeOutput({
-        status: 'success',
-        result: reply,
-        newSessionId: sessionId,
-        done: true,
-      });
+      writeOutput({ status: 'success', result: reply, newSessionId: sessionId, done: true });
 
       const nextMessage = await waitForIpcMessage();
       if (nextMessage === null) {
         log('Close sentinel received, exiting');
         break;
       }
-
       prompt = nextMessage;
     }
   } catch (err) {
-    writeOutput({
-      status: 'error',
-      result: null,
-      newSessionId: sessionId,
-      error: err instanceof Error ? err.message : String(err),
-      done: true,
-    });
+    writeOutput({ status: 'error', result: null, newSessionId: sessionId, error: err instanceof Error ? err.message : String(err), done: true });
     process.exit(1);
   }
 }
